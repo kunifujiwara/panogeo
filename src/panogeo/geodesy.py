@@ -57,7 +57,6 @@ def build_context(cam_lat: float, cam_lon: float, camera_alt_m: float, ground_al
         camera_alt_m=camera_alt_m,
         ground_alt_m=ground_alt_m,
         ecef_ref=ecef_ref,
-        R_ecef2ecef=None,  # kept for compatibility; not used
         R_ecef2enu=R_ecef2enu,
         R_enu2ecef=R_enu2ecef,
         ecef_from_llh=ecef_from_llh,

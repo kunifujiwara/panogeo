@@ -10,7 +10,6 @@ import pandas as pd
 from PIL import Image
 
 from .geometry import shift_equirect
-from .detection import detect_folder, DetectConfig, TilingConfig
 from .calibration import solve_calibration, save_calibration
 from .geolocate import geolocate_detections
 
@@ -37,8 +36,17 @@ def cmd_shift(args: argparse.Namespace) -> None:
 
 
 def cmd_detect(args: argparse.Namespace) -> None:
+    # Lazy import to avoid loading heavy dependencies (cv2/ultralytics) unless needed
+    from .detection import detect_folder, DetectConfig, TilingConfig
+
     dcfg = DetectConfig(model_name=args.model, conf_thres=args.conf, iou_thres=args.iou)
-    tcfg = TilingConfig(tile_w=args.tile_w, tile_h=args.tile_h, overlap=args.overlap, imgsz=args.imgsz, min_box_h_px=args.min_box_h)
+    tcfg = TilingConfig(
+        tile_w=args.tile_w,
+        tile_h=args.tile_h,
+        overlap=args.overlap,
+        imgsz=args.imgsz,
+        min_box_h_px=args.min_box_h,
+    )
     agg_csv = detect_folder(args.images_dir, args.output_dir, dcfg=dcfg, tcfg=tcfg)
     print(f"Detections saved: {agg_csv}")
 
