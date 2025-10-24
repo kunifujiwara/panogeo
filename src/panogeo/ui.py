@@ -87,18 +87,24 @@ class CalibrationUI:
 
         # Build map widget
         center_lat, center_lon = map_center
-        self.map = Map(center=(center_lat, center_lon), zoom=map_zoom, scroll_wheel_zoom=True)
+        self.map = Map(center=(center_lat, center_lon), zoom=map_zoom, scroll_wheel_zoom=True, max_zoom=22)
         # Prefer Google Satellite via direct TileLayer; fallback to Esri WorldImagery
         try:
             google_sat = TileLayer(
                 url='https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}',
                 name='Google Satellite',
-                attribution='Google Satellite'
+                attribution='Google Satellite',
+                max_zoom=22,
             )
             self.map.layers = tuple([google_sat])
         except Exception:
             try:
-                self.map.layers = tuple([basemap_to_tiles(basemaps.Esri.WorldImagery)])
+                esri = basemap_to_tiles(basemaps.Esri.WorldImagery)
+                try:
+                    esri.max_zoom = 22
+                except Exception:
+                    pass
+                self.map.layers = tuple([esri])
             except Exception:
                 # Fallback silently if basemap cannot be added
                 pass
