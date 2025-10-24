@@ -32,7 +32,8 @@ dependencies = [
 # Heavy/compiled extras are optional to keep base install light on Windows
 raster = ["rasterio>=1.3"]
 geo = ["geopandas>=0.14", "shapely>=2.0", "contextily>=1.5"]
-all = ["panogeo[raster,geo]"]
+ui = ["ipywidgets>=8.0", "ipyleaflet>=0.18", "ipyevents>=2.0"]
+all = ["panogeo[raster,geo,ui]"]
 
 [project.urls]
 Homepage = "https://example.com/panogeo"

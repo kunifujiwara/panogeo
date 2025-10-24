@@ -3,3 +3,58 @@
 /output/
 /yolov8s.pt
 
+# Python bytecode/cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.env
+.env.*
+.python-version
+
+# Packaging / build artifacts
+build/
+dist/
+downloads/
+wheels/
+eggs/
+.eggs/
+*.egg-info/
+share/python-wheels/
+pip-wheel-metadata/
+pip-log.txt
+installer.cfg
+MANIFEST
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Test / Coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Type checkers / linters
+.mypy_cache/
+.ruff_cache/
+.pytype/
+.pyre/
+.pyright/
+
+# Editors / IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Misc logs
+*.log
+
