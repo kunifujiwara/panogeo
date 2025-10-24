@@ -1,0 +1,57 @@
+Metadata-Version: 2.4
+Name: panogeo
+Version: 0.1.0
+Summary: Detect and geolocate people from panoramic imagery with calibration
+Author: panogeo
+License: MIT
+Project-URL: Homepage, https://example.com/panogeo
+Keywords: panoramic,equirectangular,geolocation,computer-vision,yolo,folium
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: numpy>=1.23
+Requires-Dist: pandas>=2.0
+Requires-Dist: opencv-python>=4.6
+Requires-Dist: Pillow>=9.0
+Requires-Dist: ultralytics>=8.0
+Requires-Dist: pyproj>=3.6
+Requires-Dist: folium>=0.15
+Provides-Extra: raster
+Requires-Dist: rasterio>=1.3; extra == "raster"
+Provides-Extra: geo
+Requires-Dist: geopandas>=0.14; extra == "geo"
+Requires-Dist: shapely>=2.0; extra == "geo"
+Requires-Dist: contextily>=1.5; extra == "geo"
+Provides-Extra: all
+Requires-Dist: panogeo[geo,raster]; extra == "all"
+
+# panogeo
+
+Detect and geolocate people from equirectangular 360° panoramas. Includes calibration from pixel↔geo pairs.
+
+## Install
+
+```bash
+pip install -e .
+```
+
+Optional extras:
+
+```bash
+pip install .[raster]   # DEM support via rasterio
+pip install .[geo]      # map rendering via geopandas/contextily
+```
+
+## CLI
+
+```bash
+panogeo shift-pano --in-dir <images> --out-dir <shifted> --degrees 180
+panogeo detect --images-dir <images> --output-dir <out> --model yolov8s.pt
+panogeo calibrate --calib-csv <calib_points.csv> --cam-lat <lat> --cam-lon <lon> --output-dir <out>
+panogeo geolocate --detections-csv <detections_all.csv> --calib <calibration_cam2enu.npz> --output-dir <out> [--dem <dem.tif>]
+panogeo map --geo-csv <all_people_geo_calibrated.csv> --out-html <map.html>
+```
+
+See `360detection.ipynb` for the original workflow this library is based on.

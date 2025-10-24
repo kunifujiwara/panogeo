@@ -1,0 +1,19 @@
+name: panogeo
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - numpy>=1.23
+  - pandas>=2
+  - opencv
+  - pillow
+  - pyproj>=3.6
+  - folium
+  # Optional geospatial extras (DEM and mapping)
+  - rasterio
+  - geopandas
+  - shapely>=2
+  - contextily
+  - pip:
+      - ultralytics>=8.0

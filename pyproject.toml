@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "panogeo"
+version = "0.1.0"
+description = "Detect and geolocate people from panoramic imagery with calibration"
+readme = "README.md"
+authors = [
+  { name = "panogeo" }
+]
+requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = ["panoramic", "equirectangular", "geolocation", "computer-vision", "yolo", "folium"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+]
+dependencies = [
+  "numpy>=1.23",
+  "pandas>=2.0",
+  "opencv-python>=4.6",
+  "Pillow>=9.0",
+  "ultralytics>=8.0",
+  "pyproj>=3.6",
+  "folium>=0.15",
+]
+
+[project.optional-dependencies]
+# Heavy/compiled extras are optional to keep base install light on Windows
+raster = ["rasterio>=1.3"]
+geo = ["geopandas>=0.14", "shapely>=2.0", "contextily>=1.5"]
+all = ["panogeo[raster,geo]"]
+
+[project.urls]
+Homepage = "https://example.com/panogeo"
+
+[project.scripts]
+panogeo = "panogeo.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
