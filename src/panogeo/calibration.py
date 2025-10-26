@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Iterable, List, Optional, Tuple
 
 import numpy as np
+from scipy.optimize import least_squares
 import pandas as pd
 
 from .geometry import pixel_to_cam_ray
@@ -18,6 +19,9 @@ class CalibrationResult:
     yaw_deg: float
     pitch_deg: float
     roll_deg: float
+    cam_lat: float
+    cam_lon: float
+    camera_alt_m: float
 
 
 def _matrix_to_ypr(R: np.ndarray) -> Tuple[float, float, float]:
@@ -53,6 +57,7 @@ def solve_calibration(
     ground_alt_m: float = 0.0,
     default_width: int = 2048,
     default_height: int = 1024,
+    optimize_cam_position: bool = True,
 ) -> CalibrationResult:
     df = pd.read_csv(calib_csv)
     cols = {c.lower(): c for c in df.columns}
@@ -70,10 +75,9 @@ def solve_calibration(
     W_col = cols.get("w", None)
     H_col = cols.get("h", None)
 
-    ecef_ref, R_ecef2enu, ecef_from_llh = _ecef_context(cam_lat, cam_lon, camera_alt_m, ground_alt_m)
-
+    # Precompute camera rays and store world LLH targets
     cam_vecs: List[np.ndarray] = []
-    enu_vecs: List[np.ndarray] = []
+    world_llh: List[Tuple[float, float, float]] = []
 
     for r in df.itertuples(index=False):
         W = int(getattr(r, W_col, default_width)) if W_col else default_width
@@ -85,29 +89,67 @@ def solve_calibration(
         alt = float(getattr(r, alt_col)) if alt_col and not pd.isna(getattr(r, alt_col)) else ground_alt_m
 
         cam_v = pixel_to_cam_ray(u, v, W, H)
-        enu_v = _world_llh_to_enu_vec(lon, lat, alt, ecef_ref, R_ecef2enu, ecef_from_llh)
-        n = np.linalg.norm(enu_v)
-        if n < 1e-6:
-            continue
-        enu_v = enu_v / n
         cam_vecs.append(cam_v)
-        enu_vecs.append(enu_v)
+        world_llh.append((lon, lat, alt))
 
     if len(cam_vecs) < 2:
         raise ValueError("Need at least 2 calibration pairs")
 
-    cam_mat = np.stack(cam_vecs, axis=1)
-    enu_mat = np.stack(enu_vecs, axis=1)
+    cam_mat = np.stack(cam_vecs, axis=1)  # 3 x N
 
-    Hmat = cam_mat @ enu_mat.T
-    U, S, Vt = np.linalg.svd(Hmat)
-    R_cam2enu = Vt.T @ U.T
-    if np.linalg.det(R_cam2enu) < 0:
-        Vt[2, :] *= -1
-        R_cam2enu = Vt.T @ U.T
+    def _compute_rotation_and_residuals(lat: float, lon: float, alt_cam: float) -> Tuple[np.ndarray, np.ndarray]:
+        ecef_ref, R_ecef2enu, ecef_from_llh = _ecef_context(lat, lon, alt_cam, ground_alt_m)
+        enu_vecs: List[np.ndarray] = []
+        for (lon_i, lat_i, alt_i) in world_llh:
+            enu_v = _world_llh_to_enu_vec(lon_i, lat_i, alt_i, ecef_ref, R_ecef2enu, ecef_from_llh)
+            n = float(np.linalg.norm(enu_v))
+            if n < 1e-9:
+                enu_vecs.append(np.array([0.0, 0.0, 0.0], dtype=float))
+            else:
+                enu_vecs.append(enu_v / n)
+        enu_mat = np.stack(enu_vecs, axis=1)  # 3 x N
+        Hmat = cam_mat @ enu_mat.T
+        U, S, Vt = np.linalg.svd(Hmat)
+        R = Vt.T @ U.T
+        if np.linalg.det(R) < 0:
+            Vt[2, :] *= -1
+            R = Vt.T @ U.T
+        aligned = R @ cam_mat
+        dots = np.sum(aligned * enu_mat, axis=0)
+        dots = np.clip(dots, -1.0, 1.0)
+        residuals = 1.0 - dots  # prefer alignment (dot->1)
+        return R, residuals
 
+    lat0, lon0, alt0 = float(cam_lat), float(cam_lon), float(camera_alt_m)
+
+    if optimize_cam_position:
+        def fun(x: np.ndarray) -> np.ndarray:
+            R_tmp, res = _compute_rotation_and_residuals(float(x[0]), float(x[1]), float(x[2]))
+            return res
+
+        # Reasonable bounds: small box around initial guess for lat/lon, altitude within +/- 20 m
+        # If needed, these can be expanded by the caller later.
+        lat_eps = 0.001  # ~111 m * 0.001 ≈ 0.111 km in latitude
+        lon_eps = 0.001  # ~111 m * cos(lat)
+        alt_eps = 20.0
+        lower = np.array([lat0 - lat_eps, lon0 - lon_eps, alt0 - alt_eps], dtype=float)
+        upper = np.array([lat0 + lat_eps, lon0 + lon_eps, alt0 + alt_eps], dtype=float)
+        res_ls = least_squares(fun, x0=np.array([lat0, lon0, alt0], dtype=float), bounds=(lower, upper), method="trf")
+        opt_lat, opt_lon, opt_alt = [float(v) for v in res_ls.x]
+    else:
+        opt_lat, opt_lon, opt_alt = lat0, lon0, alt0
+
+    R_cam2enu, _ = _compute_rotation_and_residuals(opt_lat, opt_lon, opt_alt)
     yaw, pitch, roll = _matrix_to_ypr(R_cam2enu)
-    return CalibrationResult(R_cam2enu=R_cam2enu, yaw_deg=yaw, pitch_deg=pitch, roll_deg=roll)
+    return CalibrationResult(
+        R_cam2enu=R_cam2enu,
+        yaw_deg=yaw,
+        pitch_deg=pitch,
+        roll_deg=roll,
+        cam_lat=opt_lat,
+        cam_lon=opt_lon,
+        camera_alt_m=opt_alt,
+    )
 
 
 def save_calibration(npz_path: str, calib: CalibrationResult, cam_lat: float, cam_lon: float, camera_alt_m: float, ground_alt_m: float) -> None:

@@ -4,6 +4,7 @@ opencv-python>=4.6
 Pillow>=9.0
 ultralytics>=8.0
 pyproj>=3.6
+scipy>=1.10
 folium>=0.15
 
 [all]
@@ -13,6 +14,8 @@ panogeo[geo,raster,ui]
 geopandas>=0.14
 shapely>=2.0
 contextily>=1.5
+matplotlib>=3.7
+h3>=3.7
 
 [raster]
 rasterio>=1.3

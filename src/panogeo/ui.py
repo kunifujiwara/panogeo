@@ -80,6 +80,8 @@ class CalibrationUI:
         self._drag_moved: bool = False
         self._viewport_w_px: Optional[float] = None
         self._viewport_h_px: Optional[float] = None
+        # Mode: 'point' to select pixels, 'pan' to drag/zoom image
+        self.mode: str = "point"
 
         # Widgets
         self.out = widgets.Output(layout=widgets.Layout(max_height="200px", overflow_y="auto"))
@@ -89,6 +91,14 @@ class CalibrationUI:
         self.btn_save = widgets.Button(description="Save CSV", button_style="success")
         self.btn_undo = widgets.Button(description="Undo last", button_style="warning")
         self.btn_clear = widgets.Button(description="Clear all", button_style="danger")
+
+        # Mode toggle
+        self.mode_toggle = widgets.ToggleButtons(
+            options=[("Point", "point"), ("Pan/Zoom", "pan")],
+            value="point",
+            description="Mode",
+        )
+        self.mode_toggle.observe(self._on_mode_change, names="value")
 
         # Optional zoom control
         if self.enable_zoom:
@@ -176,7 +186,7 @@ class CalibrationUI:
         self.btn_undo.on_click(self._on_undo)
 
         # Layout
-        controls_children = [self.alt_input, self.fn_input, self.btn_save, self.btn_undo, self.btn_clear]
+        controls_children = [self.mode_toggle, self.alt_input, self.fn_input, self.btn_save, self.btn_undo, self.btn_clear]
         if self.enable_zoom and self.zoom_slider is not None:
             controls_children.append(self.zoom_slider)
         controls = widgets.HBox(controls_children)
@@ -193,6 +203,7 @@ class CalibrationUI:
         self._set_status()
         self._update_image_widget()
         self._apply_image_layout()
+        self._apply_cursor()
 
     # Event handlers
     def _on_image_event(self, event):
@@ -202,9 +213,11 @@ class CalibrationUI:
             if self._drag_moved:
                 self._drag_moved = False
                 return
-            self._on_image_click(event)
+            # Only in point mode
+            if self.mode == "point":
+                self._on_image_click(event)
             return
-        if etype == "wheel" and self.enable_zoom and self.zoom_slider is not None:
+        if etype == "wheel" and self.enable_zoom and self.zoom_slider is not None and self.mode == "pan":
             try:
                 dy = float(event.get("deltaY", 0.0))
             except Exception:
@@ -234,7 +247,7 @@ class CalibrationUI:
             except Exception:
                 pass
 
-        if etype == "mousedown":
+        if etype == "mousedown" and self.mode == "pan":
             try:
                 cx = float(event.get("clientX", 0.0))
                 cy = float(event.get("clientY", 0.0))
@@ -244,8 +257,12 @@ class CalibrationUI:
             self._drag_moved = False
             self._drag_start_client = (cx, cy)
             self._drag_start_pan = (self.pan_x_px, self.pan_y_px)
+            try:
+                self.img_widget.layout.cursor = "grabbing"
+            except Exception:
+                pass
             return
-        if etype == "mousemove" and self._is_dragging:
+        if etype == "mousemove" and self._is_dragging and self.mode == "pan":
             try:
                 cx = float(event.get("clientX", 0.0))
                 cy = float(event.get("clientY", 0.0))
@@ -263,6 +280,7 @@ class CalibrationUI:
             return
         if etype in ("mouseup", "mouseleave"):
             self._is_dragging = False
+            self._apply_cursor()
             return
 
     def _on_image_click(self, event):
@@ -463,6 +481,23 @@ class CalibrationUI:
         else:
             cy = min(max(0.0, py), vmax_y)
         return cx, cy
+
+    def _on_mode_change(self, change) -> None:
+        self.mode = str(change.get("new", "point"))
+        # Update cursor and prevent unintended clicks after a mode switch
+        self._is_dragging = False
+        self._drag_moved = False
+        self._apply_cursor()
+        self._set_status()
+
+    def _apply_cursor(self) -> None:
+        try:
+            if self.mode == "pan":
+                self.img_widget.layout.cursor = "grab"
+            else:
+                self.img_widget.layout.cursor = "crosshair"
+        except Exception:
+            pass
 
     def display(self):  # convenience
         if widgets is None:
