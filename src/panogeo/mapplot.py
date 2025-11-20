@@ -11,6 +11,9 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
+import matplotlib.cm as cm  # noqa: E402
+from matplotlib.colors import Normalize  # noqa: E402
+from matplotlib.ticker import MaxNLocator  # noqa: E402
 from .utils import extract_timestamp_text
 
 try:
@@ -347,6 +350,8 @@ def save_h3_basemap(
     linewidth: float = 0.4,
     vmin: Optional[float] = None,
     vmax: Optional[float] = None,
+    add_colorbar: bool = False,
+    colorbar_label: Optional[str] = None,
 ) -> str:
     """
     Render and save an H3-aggregated people-location map as a PNG basemap overlay.
@@ -419,7 +424,9 @@ def save_h3_basemap(
     fig_w = base_w_in
     fig_h = max(1e-6, base_w_in * (span_y / span_x))
     fig = plt.figure(figsize=(fig_w, fig_h))
-    ax = fig.add_axes([0.0, 0.0, 1.0, 1.0])
+    # Leave room at the right for colorbar ticks when requested
+    ax_rect = [0.0, 0.0, 0.93, 1.0] if add_colorbar else [0.0, 0.0, 1.0, 1.0]
+    ax = fig.add_axes(ax_rect)
     ax.set_axis_off()
 
     # Extent and basemap
@@ -433,7 +440,7 @@ def save_h3_basemap(
     ax.set_aspect("equal", adjustable="box")
 
     # Draw hexagons
-    gdf_hex_merc.plot(
+    col_plot = gdf_hex_merc.plot(
         ax=ax,
         column="value",
         cmap=cmap,
@@ -444,10 +451,42 @@ def save_h3_basemap(
         vmax=vmax,
     )
 
+    # Optional colorbar
+    if add_colorbar:
+        # Determine normalization consistent with the plot
+        data_vals = gdf_hex_merc["value"].astype(float)
+        vmin_val = float(vmin) if vmin is not None else float(data_vals.min())
+        vmax_val = float(vmax) if vmax is not None else float(data_vals.max())
+        if vmin_val == vmax_val:
+            # Avoid degenerate norm
+            vmin_val -= 0.5
+            vmax_val += 0.5
+        cmap_obj = cm.get_cmap(cmap)
+        norm = Normalize(vmin=vmin_val, vmax=vmax_val)
+        mappable = cm.ScalarMappable(norm=norm, cmap=cmap_obj)
+        mappable.set_array([])
+        cbar = fig.colorbar(mappable, ax=ax, fraction=0.035, pad=0.02)
+        # Improve readability on busy imagery backgrounds
+        try:
+            cbar.ax.set_facecolor((1.0, 1.0, 1.0, 0.75))
+        except Exception:
+            pass
+        cbar.outline.set_edgecolor("#000000")
+        cbar.ax.tick_params(labelsize=9, colors="#000000")
+        # Use integer tick locator when showing counts
+        is_count = (weight_col is None) or (weight_col not in df.columns)
+        if is_count:
+            cbar.ax.yaxis.set_major_locator(MaxNLocator(nbins=6, integer=True, prune=None))
+        if colorbar_label is None:
+            colorbar_label = "count" if is_count else str(weight_col)
+        if colorbar_label:
+            cbar.set_label(colorbar_label, fontsize=10, color="#000000")
+
     out_dir = os.path.dirname(os.path.abspath(out_png))
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
-    fig.savefig(out_png, dpi=dpi)
+    # Tight bbox ensures colorbar tick labels are not clipped
+    fig.savefig(out_png, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
     return out_png
 
