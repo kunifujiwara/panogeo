@@ -352,6 +352,7 @@ def save_h3_basemap(
     vmax: Optional[float] = None,
     add_colorbar: bool = False,
     colorbar_label: Optional[str] = None,
+    rasterized: Optional[bool] = None,
 ) -> str:
     """
     Render and save an H3-aggregated people-location map as a PNG basemap overlay.
@@ -440,7 +441,7 @@ def save_h3_basemap(
     ax.set_aspect("equal", adjustable="box")
 
     # Draw hexagons
-    col_plot = gdf_hex_merc.plot(
+    plot_kwargs = dict(
         ax=ax,
         column="value",
         cmap=cmap,
@@ -450,6 +451,9 @@ def save_h3_basemap(
         vmin=vmin,
         vmax=vmax,
     )
+    if rasterized is not None:
+        plot_kwargs["rasterized"] = bool(rasterized)
+    col_plot = gdf_hex_merc.plot(**plot_kwargs)
 
     # Optional colorbar
     if add_colorbar:
