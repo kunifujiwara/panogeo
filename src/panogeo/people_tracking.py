@@ -1,0 +1,337 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Callable, Deque, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from collections import deque
+from pathlib import Path
+import time
+
+import cv2
+import numpy as np
+
+
+# Public API
+__all__ = [
+    "Track",
+    "CentroidTracker",
+    "load_model",
+    "run_tracking",
+]
+
+
+@dataclass
+class Track:
+    object_id: int
+    centroid: Tuple[int, int]
+    bbox: Tuple[int, int, int, int]
+    disappeared: int = 0
+
+
+class CentroidTracker:
+    def __init__(self, max_disappeared: int = 30, max_distance: float = 110.0):
+        self.next_object_id: int = 0
+        self.tracks: Dict[int, Track] = {}
+        self.max_disappeared = max_disappeared
+        self.max_distance = max_distance
+
+    def register(self, centroid: Tuple[int, int], bbox: Tuple[int, int, int, int]) -> None:
+        self.tracks[self.next_object_id] = Track(
+            object_id=self.next_object_id,
+            centroid=centroid,
+            bbox=bbox,
+            disappeared=0,
+        )
+        self.next_object_id += 1
+
+    def deregister(self, object_id: int) -> None:
+        if object_id in self.tracks:
+            del self.tracks[object_id]
+
+    def update(self, rects: List[Tuple[int, int, int, int]]) -> Dict[int, Track]:
+        if len(rects) == 0:
+            for object_id in list(self.tracks.keys()):
+                self.tracks[object_id].disappeared += 1
+                if self.tracks[object_id].disappeared > self.max_disappeared:
+                    self.deregister(object_id)
+            return dict(self.tracks)
+
+        input_centroids = np.zeros((len(rects), 2), dtype=np.float32)
+        for i, (x1, y1, x2, y2) in enumerate(rects):
+            cX = int((x1 + x2) * 0.5)
+            cY = int((y1 + y2) * 0.5)
+            input_centroids[i] = (cX, cY)
+
+        if len(self.tracks) == 0:
+            for i, box in enumerate(rects):
+                self.register((int(input_centroids[i][0]), int(input_centroids[i][1])), box)
+            return dict(self.tracks)
+
+        object_ids = list(self.tracks.keys())
+        object_centroids = np.array([self.tracks[oid].centroid for oid in object_ids], dtype=np.float32)
+
+        D = np.linalg.norm(object_centroids[:, None, :] - input_centroids[None, :, :], axis=2)
+
+        rows = D.min(axis=1).argsort()
+        cols = D.argmin(axis=1)[rows]
+
+        used_rows = set()
+        used_cols = set()
+
+        for row, col in zip(rows, cols):
+            if row in used_rows or col in used_cols:
+                continue
+            if D[row, col] > self.max_distance:
+                continue
+
+            object_id = object_ids[row]
+            centroid = (int(input_centroids[col][0]), int(input_centroids[col][1]))
+            self.tracks[object_id].centroid = centroid
+            self.tracks[object_id].bbox = rects[col]
+            self.tracks[object_id].disappeared = 0
+
+            used_rows.add(row)
+            used_cols.add(col)
+
+        unused_rows = set(range(0, D.shape[0])).difference(used_rows)
+        unused_cols = set(range(0, D.shape[1])).difference(used_cols)
+
+        for row in unused_rows:
+            object_id = object_ids[row]
+            self.tracks[object_id].disappeared += 1
+            if self.tracks[object_id].disappeared > self.max_disappeared:
+                self.deregister(object_id)
+
+        for col in unused_cols:
+            centroid = (int(input_centroids[col][0]), int(input_centroids[col][1]))
+            self.register(centroid, rects[col])
+
+        return dict(self.tracks)
+
+
+def load_model(model: Union[str, Path, Sequence[Union[str, Path]]]):
+    from ultralytics import YOLO
+
+    last_error: Optional[Exception] = None
+    # Single name/path: try directly (Ultralytics will download if needed)
+    if isinstance(model, (str, Path)):
+        return YOLO(str(model))
+    # Sequence of candidates: try in order
+    for candidate in model:
+        try:
+            return YOLO(str(candidate))
+        except Exception as e:
+            last_error = e
+    raise RuntimeError(f"Could not load any model from {model}. Last error: {last_error}")
+
+
+def _det_to_boxes(result, frame_w: int, frame_h: int, person_class_id: int, conf_thres: float) -> List[Tuple[int, int, int, int]]:
+    boxes_xyxy: List[Tuple[int, int, int, int]] = []
+    if result is None or result.boxes is None or len(result.boxes) == 0:
+        return boxes_xyxy
+    xyxy = result.boxes.xyxy.cpu().numpy().astype(int)
+    confs = result.boxes.conf.cpu().numpy()
+    clss = result.boxes.cls.cpu().numpy().astype(int)
+    for (x1, y1, x2, y2), c, k in zip(xyxy, confs, clss):
+        if k == person_class_id and c >= conf_thres:
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(frame_w - 1, x2), min(frame_h - 1, y2)
+            if x2 > x1 and y2 > y1:
+                boxes_xyxy.append((x1, y1, x2, y2))
+    return boxes_xyxy
+
+
+def run_tracking(
+    video_path: Union[str, Path],
+    output_path: Optional[Union[str, Path]],
+    model: Union[str, Path, Sequence[Union[str, Path]], None] = None,
+    model_candidates: Optional[Sequence[Union[str, Path]]] = None,
+    *,
+    conf_thres: float = 0.08,
+    iou_thres: float = 0.45,
+    imgsz: int = 1920,
+    max_det: int = 3000,
+    person_class_id: int = 0,
+    agnostic_nms: bool = True,
+    device: Union[int, str] = 0,
+    half: bool = True,
+    amp: bool = True,
+    enable_counting: bool = False,
+    line_y_fraction: float = 0.55,
+    center_crop: Optional[Tuple[int, int]] = None,  # (crop_w, crop_h) from center
+    show_trajectories: bool = False,
+    traj_max_points: int = 40,
+    traj_thickness: int = 2,
+    max_disappeared: int = 30,
+    max_distance: float = 110.0,
+    progress_callback: Optional[Callable[[int, Optional[int]], None]] = None,
+    show_progress: bool = True,
+    progress_desc: Optional[str] = None,
+) -> Path:
+    """
+    Process a video to detect and track people, optionally center-cropping and drawing trajectories.
+    Returns the output video path.
+    - Pass a single model name/path via `model` (e.g., "yolo12m.pt"); Ultralytics will download if needed.
+    - For backward compatibility, `model_candidates` can still be provided to try multiple in order.
+    """
+    if model is None and model_candidates is None:
+        raise ValueError("Specify `model` (preferred) or `model_candidates`.")
+    model_obj = load_model(model if model is not None else model_candidates)  # type: ignore[arg-type]
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise FileNotFoundError(f"Cannot open video: {video_path}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    if center_crop is not None:
+        crop_w = min(center_crop[0], src_w)
+        crop_h = min(center_crop[1], src_h)
+        x0 = max(0, (src_w - crop_w) // 2)
+        y0 = max(0, (src_h - crop_h) // 2)
+        x1 = x0 + crop_w
+        y1 = y0 + crop_h
+        out_w, out_h = crop_w, crop_h
+    else:
+        x0 = 0
+        y0 = 0
+        x1 = src_w
+        y1 = src_h
+        out_w, out_h = src_w, src_h
+
+    # Output path
+    if output_path is None:
+        out_dir = Path(video_path).parent
+        output_path = out_dir / "_tracked.mp4"
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(str(output_path), fourcc, fps, (out_w, out_h))
+
+    tracker = CentroidTracker(max_disappeared=max_disappeared, max_distance=max_distance)
+    prev_centroids: Dict[int, Tuple[int, int]] = {}
+
+    tracks_history: Dict[int, Deque[Tuple[int, int]]] = {}
+    if show_trajectories:
+        tracks_history = {}
+
+    predict_kwargs = dict(
+        conf=conf_thres,
+        iou=iou_thres,
+        imgsz=imgsz,
+        classes=[person_class_id],
+        agnostic_nms=agnostic_nms,
+        max_det=max_det,
+        augment=True,
+        verbose=False,
+        device=device,
+        half=half,
+        amp=amp,
+    )
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if total_frames <= 0:
+        total_frames = None
+
+    # Progress bar (tqdm) setup
+    pbar = None
+    if show_progress:
+        try:
+            from tqdm import tqdm  # type: ignore
+            if progress_desc is None:
+                if center_crop is not None and show_trajectories:
+                    progress_desc = "Center-crop w/ traj"
+                elif center_crop is not None:
+                    progress_desc = "Center-crop"
+                elif show_trajectories:
+                    progress_desc = "Full-frame w/ traj"
+                else:
+                    progress_desc = "Full-frame"
+            pbar = tqdm(total=total_frames, desc=progress_desc, unit="frame")
+        except Exception:
+            pbar = None
+
+    line_y = int(line_y_fraction * out_h)
+    start_time = time.time()
+    frame_count = 0
+
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        frame_count += 1
+        if progress_callback is not None:
+            progress_callback(frame_count, total_frames)
+        if pbar is not None:
+            pbar.update(1)
+
+        roi = frame[y0:y1, x0:x1]
+        results = model_obj.predict(roi, **predict_kwargs)
+        result = results[0] if len(results) > 0 else None
+        boxes_xyxy = _det_to_boxes(result, out_w, out_h, person_class_id, conf_thres)
+
+        tracks = tracker.update(boxes_xyxy)
+
+        if enable_counting:
+            for oid, tr in tracks.items():
+                cX, cY = tr.centroid
+                if oid in prev_centroids:
+                    prevY = prev_centroids[oid][1]
+                    if prevY < line_y <= cY:
+                        # entering
+                        pass
+                    elif prevY > line_y >= cY:
+                        # exiting
+                        pass
+                prev_centroids[oid] = (cX, cY)
+
+        if show_trajectories:
+            for oid, tr in tracks.items():
+                cX, cY = tr.centroid
+                if oid not in tracks_history:
+                    tracks_history[oid] = deque(maxlen=traj_max_points)
+                tracks_history[oid].append((cX, cY))
+
+        # Drawing
+        if enable_counting:
+            cv2.line(roi, (0, line_y), (out_w, line_y), (0, 255, 255), 2)
+
+        for oid, tr in tracks.items():
+            x1b, y1b, x2b, y2b = tr.bbox
+            cX, cY = tr.centroid
+            color = _id_color(oid)
+            cv2.rectangle(roi, (x1b, y1b), (x2b, y2b), color, 2)
+            cv2.circle(roi, (cX, cY), 3, (0, 255, 255), -1)
+            cv2.putText(roi, f"ID {oid}", (x1b, max(0, y1b - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            if show_trajectories:
+                pts = tracks_history.get(oid, None)
+                if pts and len(pts) > 1:
+                    for i in range(1, len(pts)):
+                        cv2.line(roi, pts[i - 1], pts[i], color, traj_thickness)
+
+        elapsed = time.time() - start_time
+        if elapsed > 0:
+            fps_text = f"FPS: {frame_count / elapsed:.1f}"
+            cv2.putText(roi, fps_text, (out_w - 200, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (50, 220, 50), 2)
+            if total_frames:
+                prog_text = f"{frame_count}/{total_frames}"
+                cv2.putText(roi, prog_text, (out_w - 200, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 50), 2)
+
+        writer.write(roi)
+
+    cap.release()
+    writer.release()
+    if pbar is not None:
+        pbar.close()
+    return output_path
+
+
+def _id_color(oid: int) -> Tuple[int, int, int]:
+    r = (37 * oid) % 255
+    g = (17 * oid + 85) % 255
+    b = (97 * oid + 170) % 255
+    return int(b), int(g), int(r)
+
+
