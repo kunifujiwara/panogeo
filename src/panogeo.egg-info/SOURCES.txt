@@ -9,6 +9,7 @@ src/panogeo/geolocate.py
 src/panogeo/geometry.py
 src/panogeo/mapplot.py
 src/panogeo/people_tracking.py
+src/panogeo/perspective.py
 src/panogeo/ui.py
 src/panogeo/utils.py
 src/panogeo.egg-info/PKG-INFO

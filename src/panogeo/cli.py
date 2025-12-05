@@ -12,6 +12,7 @@ from PIL import Image
 from .geometry import shift_equirect
 from .calibration import solve_calibration, save_calibration
 from .geolocate import geolocate_detections
+from .perspective import solve_homography_from_csv, save_homography, geolocate_detections_perspective
 from .mapplot import save_points_basemap, save_all_images_basemap
 
 try:
@@ -140,6 +141,14 @@ def cmd_calibrate(args: argparse.Namespace) -> None:
     print(f"CAM_LAT={res.cam_lat:.8f}, CAM_LON={res.cam_lon:.8f}, CAMERA_ALT_M={res.camera_alt_m:.2f}")
 
 
+def cmd_calibrate_persp(args: argparse.Namespace) -> None:
+    H, ref_lat, ref_lon = solve_homography_from_csv(args.calib_csv)
+    os.makedirs(args.output_dir, exist_ok=True)
+    out_npz = os.path.join(args.output_dir, "calibration_perspective.npz")
+    save_homography(out_npz, H, ref_lat=ref_lat, ref_lon=ref_lon, ground_alt_m=0.0)
+    print(f"Saved perspective homography to: {out_npz}")
+
+
 def cmd_geolocate(args: argparse.Namespace) -> None:
     xy_csv, geo_csv = geolocate_detections(
         detections_csv=args.detections_csv,
@@ -148,6 +157,19 @@ def cmd_geolocate(args: argparse.Namespace) -> None:
         dem_path=args.dem,
         max_range_m=args.max_range,
         step_m=args.step,
+    )
+    print(f"Saved: {xy_csv}\nSaved: {geo_csv}")
+
+
+def cmd_geolocate_persp(args: argparse.Namespace) -> None:
+    xy_csv, geo_csv = geolocate_detections_perspective(
+        detections_csv=args.detections_csv,
+        homography_npz=args.homography,
+        output_dir=args.output_dir,
+        debug=bool(getattr(args, "debug", False)),
+        calib_csv=getattr(args, "calib_csv", None),
+        gate_margin_m=float(getattr(args, "gate_margin_m", 150.0)),
+        drop_outside=bool(getattr(args, "drop_outside", True)),
     )
     print(f"Saved: {xy_csv}\nSaved: {geo_csv}")
 
@@ -275,6 +297,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--output-dir", required=True)
     sp.set_defaults(func=cmd_calibrate)
 
+    sp = sub.add_parser("calibrate-persp", help="Estimate pixel->geo homography from pixel↔geo pairs (perspective images)")
+    sp.add_argument("--calib-csv", required=True)
+    sp.add_argument("--output-dir", required=True)
+    sp.set_defaults(func=cmd_calibrate_persp)
+
     sp = sub.add_parser("geolocate", help="Intersect detection rays with ground/DEM using calibration")
     sp.add_argument("--detections-csv", required=True)
     sp.add_argument("--calibration", required=True, help="calibration_cam2enu.npz")
@@ -283,6 +310,16 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--max-range", type=float, default=80.0)
     sp.add_argument("--step", type=float, default=1.0)
     sp.set_defaults(func=cmd_geolocate)
+
+    sp = sub.add_parser("geolocate-persp", help="Map detections to lon/lat using pixel->geo homography (perspective images)")
+    sp.add_argument("--detections-csv", required=True)
+    sp.add_argument("--homography", required=True, help="calibration_perspective.npz")
+    sp.add_argument("--output-dir", required=True)
+    sp.add_argument("--calib-csv", default=None, help="calibration pairs CSV; when given, gate detections to calib bbox (+margin)")
+    sp.add_argument("--gate-margin-m", type=float, default=150.0, help="margin (meters) around calib bbox for gating")
+    sp.add_argument("--keep-outside", dest="drop_outside", action="store_false", help="do not drop points outside gate (set lon/lat NaN instead)")
+    sp.add_argument("--debug", action="store_true")
+    sp.set_defaults(func=cmd_geolocate_persp)
 
     sp = sub.add_parser("map", help="Build a Folium heatmap from geo CSV")
     sp.add_argument("--geo-csv", required=True)

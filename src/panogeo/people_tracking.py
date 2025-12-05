@@ -8,6 +8,7 @@ import time
 
 import cv2
 import numpy as np
+import pandas as pd
 
 
 # Public API
@@ -166,6 +167,7 @@ def run_tracking(
     progress_callback: Optional[Callable[[int, Optional[int]], None]] = None,
     show_progress: bool = True,
     progress_desc: Optional[str] = None,
+    export_csv_path: Optional[Union[str, Path]] = None,
 ) -> Path:
     """
     Process a video to detect and track people, optionally center-cropping and drawing trajectories.
@@ -216,6 +218,9 @@ def run_tracking(
     tracks_history: Dict[int, Deque[Tuple[int, int]]] = {}
     if show_trajectories:
         tracks_history = {}
+    # Optional CSV export of per-frame track points for geolocation
+    csv_rows: List[Dict[str, Union[str, int, float]]] = []
+    video_base = Path(video_path).stem
 
     predict_kwargs = dict(
         conf=conf_thres,
@@ -320,11 +325,35 @@ def run_tracking(
                 cv2.putText(roi, prog_text, (out_w - 200, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 50), 2)
 
         writer.write(roi)
+        # Collect rows for export: use bottom-center of bbox (feet) as v_px
+        if export_csv_path is not None:
+            for oid, tr in tracks.items():
+                x1b, y1b, x2b, y2b = tr.bbox
+                u = float((x1b + x2b) * 0.5)
+                v = float(y2b)
+                csv_rows.append({
+                    "video": str(video_path),
+                    "image": f"{video_base}_f{frame_count:06d}",
+                    "frame": int(frame_count),
+                    "track_id": int(oid),
+                    "W": int(out_w),
+                    "H": int(out_h),
+                    "u_px": u,
+                    "v_px": v,
+                })
 
     cap.release()
     writer.release()
     if pbar is not None:
         pbar.close()
+    # Persist CSV rows if requested
+    if export_csv_path is not None:
+        try:
+            out_csv_path = Path(export_csv_path)
+            out_csv_path.parent.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame(csv_rows).to_csv(out_csv_path, index=False)
+        except Exception:
+            pass
     return output_path
 
 

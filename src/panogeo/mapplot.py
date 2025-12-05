@@ -24,11 +24,19 @@ except Exception:  # pragma: no cover
     Point = None  # type: ignore
 
 try:
+    import cv2  # type: ignore
+except Exception:  # pragma: no cover
+    cv2 = None  # type: ignore
+
+try:
     import contextily as cx  # type: ignore
     from xyzservices import TileProvider  # type: ignore
+    # For direct tile fetching when we want to pre-cache the basemap
+    from contextily import tile as cx_tile  # type: ignore
 except Exception:  # pragma: no cover
     cx = None  # type: ignore
     TileProvider = None  # type: ignore
+    cx_tile = None  # type: ignore
 
 try:
     from pyproj import Transformer  # type: ignore
@@ -184,8 +192,44 @@ def save_points_basemap(
     ax.set_ylim(extent[2], extent[3])
     ax.set_aspect("equal", adjustable="box")
 
-    src = _get_provider(provider)
-    cx.add_basemap(ax, source=src, crs="EPSG:3857", zoom=zoom, attribution=True, reset_extent=False)
+    # Basemap with robust zoom and fallback
+    def _resolve_zoom(src_obj, requested):
+        if requested is not None:
+            try:
+                return int(requested)
+            except Exception:
+                pass
+        try:
+            z = int(getattr(src_obj, "max_zoom", 18)) - 1
+            return max(2, z)
+        except Exception:
+            return 17
+
+    def _add_basemap_with_fallback(ax, provider_name: str, requested_zoom):
+        last_err = None
+        # Try primary provider, decreasing zoom a few times
+        src_obj = _get_provider(provider_name)
+        z = _resolve_zoom(src_obj, requested_zoom)
+        for _ in range(5):
+            try:
+                cx.add_basemap(ax, source=src_obj, crs="EPSG:3857", zoom=z, attribution=True, reset_extent=False)
+                return
+            except Exception as e:
+                last_err = e
+                z = max(2, z - 1)
+        # Fallback providers
+        for fb in ("esri-world", "carto", "osm"):
+            try:
+                src_fb = _get_provider(fb)
+                z = _resolve_zoom(src_fb, requested_zoom)
+                cx.add_basemap(ax, source=src_fb, crs="EPSG:3857", zoom=z, attribution=True, reset_extent=False)
+                return
+            except Exception as e2:
+                last_err = e2
+        if last_err is not None:
+            raise last_err
+
+    _add_basemap_with_fallback(ax, provider, zoom)
     # Re-apply exact extent and aspect in case add_basemap adjusted limits internally
     ax.set_xlim(extent[0], extent[1])
     ax.set_ylim(extent[2], extent[3])
@@ -494,4 +538,231 @@ def save_h3_basemap(
     plt.close(fig)
     return out_png
 
+
+def save_tracking_map_video(
+    geo_csv: str,
+    out_mp4: str,
+    provider: str = "carto",
+    zoom: Optional[int] = None,
+    point_size: float = 16.0,
+    alpha: float = 0.95,
+    traj_max_frames: int = 60,
+    dpi: int = 150,
+    margin_frac: float = 0.10,
+    fps: Optional[float] = None,
+    show_progress: bool = True,
+    progress_desc: Optional[str] = None,
+) -> str:
+    """
+    Render a map video with tracked people positions and short trajectories.
+
+    Expects geo_csv to contain at least: 'frame', 'track_id', 'lat', 'lon' (and optionally 'image').
+    """
+    if gpd is None or cx is None:
+        raise RuntimeError("Geo plotting requires geopandas and contextily; install with `pip install panogeo[geo]`")
+    if cv2 is None:
+        raise RuntimeError("OpenCV not available; install with `pip install opencv-python`")
+
+    df = pd.read_csv(geo_csv)
+    if df.empty:
+        raise ValueError("No rows in geo CSV")
+    required = {"frame", "track_id", "lat", "lon"}
+    if not required.issubset(df.columns):
+        raise ValueError(f"CSV must contain columns: {sorted(required)}")
+
+    # Sanitize
+    df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=["lat", "lon"]).reset_index(drop=True)
+    df["frame"] = df["frame"].astype(int)
+    df["track_id"] = df["track_id"].astype(int)
+
+    # Build fixed extent from all data to avoid jitter
+    geometry = [Point(float(lon), float(lat)) for lat, lon in zip(df["lat"].astype(float), df["lon"].astype(float))]
+    gdf = gpd.GeoDataFrame(df, geometry=geometry, crs="EPSG:4326")
+    gdf_merc = gdf.to_crs(epsg=3857)
+    xmin, ymin, xmax, ymax = gdf_merc.total_bounds
+    xpad = (xmax - xmin) * margin_frac
+    ypad = (ymax - ymin) * margin_frac
+    if xpad == 0:
+        xpad = 100.0
+    if ypad == 0:
+        ypad = 100.0
+    extent = (float(xmin - xpad), float(xmax + xpad), float(ymin - ypad), float(ymax + ypad))
+
+    # Figure dims and corresponding video size
+    span_x = float(extent[1] - extent[0])
+    span_y = float(extent[3] - extent[2])
+    base_w_in = 8.0
+    fig_w = base_w_in
+    fig_h = max(1e-6, base_w_in * (span_y / span_x))
+    pixel_w = int(round(fig_w * dpi))
+    pixel_h = int(round(fig_h * dpi))
+
+    # Determine fps from data if not provided
+    if fps is None:
+        # Heuristic: if images (frames) are sparse, 10 fps; else 20
+        fps = 20.0
+
+    os.makedirs(os.path.dirname(os.path.abspath(out_mp4)) or ".", exist_ok=True)
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(out_mp4, fourcc, float(fps), (pixel_w, pixel_h))
+
+    try:
+        # Pre-split data by frame for speed
+        by_frame = {int(k): v.copy() for k, v in gdf_merc.groupby("frame")}
+        all_frames = sorted(by_frame.keys())
+
+        def _resolve_zoom(src_obj, requested):
+            if requested is not None:
+                try:
+                    return int(requested)
+                except Exception:
+                    pass
+            try:
+                z = int(getattr(src_obj, "max_zoom", 18)) - 1
+                return max(2, z)
+            except Exception:
+                return 17
+
+        def _add_basemap_with_fallback(ax, provider_name: str, requested_zoom):
+            last_err = None
+            src_obj = _get_provider(provider_name)
+            z = _resolve_zoom(src_obj, requested_zoom)
+            for _ in range(5):
+                try:
+                    cx.add_basemap(ax, source=src_obj, crs="EPSG:3857", zoom=z, attribution=False, reset_extent=False)
+                    return
+                except Exception as e:
+                    last_err = e
+                    z = max(2, z - 1)
+            for fb in ("esri-world", "carto", "osm"):
+                try:
+                    src_fb = _get_provider(fb)
+                    z = _resolve_zoom(src_fb, requested_zoom)
+                    cx.add_basemap(ax, source=src_fb, crs="EPSG:3857", zoom=z, attribution=False, reset_extent=False)
+                    return
+                except Exception as e2:
+                    last_err = e2
+            if last_err is not None:
+                raise last_err
+
+        # Try to prefetch basemap once for the fixed extent to speed up rendering
+        prefetched_basemap = None
+        try:
+            src_obj = _get_provider(provider)
+            z0 = _resolve_zoom(src_obj, zoom)
+            if cx_tile is not None:
+                # cx_tile.bounds2img expects (west, south, east, north)
+                img_tile, ext_bounds = cx_tile.bounds2img(
+                    extent[0], extent[2], extent[1], extent[3],
+                    zoom=z0, source=src_obj, ll=False
+                )
+                # Ensure we have RGB array (not masked) for imshow
+                img_np = np.asarray(img_tile)
+                if img_np.ndim == 2:
+                    # grayscale -> RGB
+                    img_np = np.stack([img_np, img_np, img_np], axis=2)
+                elif img_np.shape[2] == 4:
+                    img_np = img_np[:, :, :3]
+                prefetched_basemap = (img_np, ext_bounds)
+        except Exception:
+            prefetched_basemap = None
+
+        # Optional progress bar
+        pbar = None
+        if show_progress:
+            try:
+                from tqdm import tqdm  # type: ignore
+                pbar = tqdm(total=len(all_frames), desc=(progress_desc or "map-video"), unit="frame")
+            except Exception:
+                pbar = None
+
+        # For color-coding different tracks deterministically
+        def _id_color(oid: int) -> Tuple[float, float, float]:
+            r = (37 * oid) % 255
+            g = (17 * oid) % 255
+            b = (13 * oid) % 255
+            return (r / 255.0, g / 255.0, b / 255.0)
+
+        for idx, f in enumerate(all_frames):
+            # Collect recent history up to traj_max_frames
+            f0 = max(all_frames[0], f - int(traj_max_frames) + 1)
+            frames_range = [ff for ff in all_frames if f0 <= ff <= f]
+            # Create a fresh figure per frame (Agg)
+            fig = plt.figure(figsize=(fig_w, fig_h))
+            ax = fig.add_axes([0.0, 0.0, 1.0, 1.0])
+            ax.set_axis_off()
+            ax.set_xlim(extent[0], extent[1])
+            ax.set_ylim(extent[2], extent[3])
+            ax.set_aspect("equal", adjustable="box")
+            if prefetched_basemap is not None:
+                img_np, ext_bounds = prefetched_basemap
+                ax.imshow(img_np, extent=ext_bounds, origin="upper")
+            else:
+                _add_basemap_with_fallback(ax, provider, zoom)
+            ax.set_xlim(extent[0], extent[1])
+            ax.set_ylim(extent[2], extent[3])
+
+            # Draw trajectories per track id
+            # Build a dict: track_id -> list of (x,y) for frames in range (ordered)
+            traj_points = {}
+            for ff in frames_range:
+                gff = by_frame.get(ff)
+                if gff is None or gff.empty:
+                    continue
+                for r in gff.itertuples():
+                    oid = int(getattr(r, "track_id"))
+                    x = float(r.geometry.x)
+                    y = float(r.geometry.y)
+                    traj_points.setdefault(oid, []).append((x, y))
+            for oid, pts in traj_points.items():
+                if len(pts) >= 2:
+                    xs = [p[0] for p in pts]
+                    ys = [p[1] for p in pts]
+                    ax.plot(xs, ys, color=_id_color(oid), linewidth=2.0, alpha=0.9, solid_capstyle="round")
+
+            # Draw current-frame points on top
+            gcur = by_frame[f]
+            if not gcur.empty:
+                for r in gcur.itertuples():
+                    oid = int(getattr(r, "track_id"))
+                    x = float(r.geometry.x)
+                    y = float(r.geometry.y)
+                    ax.scatter([x], [y], s=point_size, color=_id_color(oid), alpha=alpha, zorder=100)
+
+            # Render to RGB array
+            fig.canvas.draw()
+            # Prefer buffer_rgba (works across recent Matplotlib versions)
+            h_px = int(fig.canvas.get_width_height()[1])
+            w_px = int(fig.canvas.get_width_height()[0])
+            try:
+                buf = fig.canvas.buffer_rgba()
+                img_rgba = np.frombuffer(buf, dtype=np.uint8).reshape((h_px, w_px, 4))
+                img = img_rgba[:, :, :3]  # drop alpha
+            except Exception:
+                # Fallback to tostring_rgb if available
+                img = np.frombuffer(getattr(fig.canvas, "tostring_rgb")(), dtype=np.uint8).reshape((h_px, w_px, 3))
+            plt.close(fig)
+
+            # Convert RGB->BGR for OpenCV and ensure exact video size
+            if img.shape[1] != pixel_w or img.shape[0] != pixel_h:
+                img = cv2.resize(img, (pixel_w, pixel_h), interpolation=cv2.INTER_LINEAR)
+            frame_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+            writer.write(frame_bgr)
+
+            if pbar is not None:
+                pbar.update(1)
+            elif show_progress and (idx % 25 == 0):
+                try:
+                    print(f"[map-video] frame {idx+1}/{len(all_frames)}", flush=True)
+                except Exception:
+                    pass
+    finally:
+        writer.release()
+        try:
+            if pbar is not None:
+                pbar.close()
+        except Exception:
+            pass
+
+    return out_mp4
 

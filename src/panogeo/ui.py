@@ -6,12 +6,17 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import pandas as pd
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
+
+try:
+    import cv2  # optional, used for reading first frame from video
+except Exception:  # pragma: no cover
+    cv2 = None  # type: ignore
 
 
 try:  # UI stack is optional and used mainly within Jupyter
     import ipywidgets as widgets
-    from ipyleaflet import Map, Marker, basemaps, basemap_to_tiles, LayersControl, TileLayer
+    from ipyleaflet import Map, Marker, basemaps, basemap_to_tiles, LayersControl, TileLayer, DivIcon
     from ipyevents import Event
 except Exception:  # pragma: no cover
     widgets = None  # type: ignore
@@ -21,6 +26,7 @@ except Exception:  # pragma: no cover
     basemap_to_tiles = None  # type: ignore
     LayersControl = None  # type: ignore
     TileLayer = None  # type: ignore
+    DivIcon = None  # type: ignore
     Event = None  # type: ignore
 
 
@@ -45,6 +51,11 @@ class CalibrationUI:
         default_alt_m: Optional[float] = None,
         enable_zoom: bool = True,
         image_viewport_height_px: int = 480,
+        projection: str = "pano",
+        fx_px: Optional[float] = None,
+        fy_px: Optional[float] = None,
+        cx_px: Optional[float] = None,
+        cy_px: Optional[float] = None,
     ) -> None:
         if widgets is None or Map is None or Event is None:
             raise RuntimeError(
@@ -55,7 +66,21 @@ class CalibrationUI:
             raise FileNotFoundError(pano_path)
 
         self.pano_path = pano_path
-        self.image_base = Image.open(pano_path).convert("RGB")
+        # Accept either a still image or a video file; for video, use the first frame
+        _, ext = os.path.splitext(pano_path)
+        is_video = ext.lower() in (".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".mpg", ".mpeg")
+        if is_video:
+            if cv2 is None:
+                raise RuntimeError("OpenCV not available to read video. Install with: pip install opencv-python")
+            cap = cv2.VideoCapture(pano_path)
+            ok, frame_bgr = cap.read()
+            cap.release()
+            if not ok or frame_bgr is None:
+                raise ValueError(f"Failed to read first frame from video: {pano_path}")
+            frame_rgb = frame_bgr[:, :, ::-1]
+            self.image_base = Image.fromarray(frame_rgb)
+        else:
+            self.image_base = Image.open(pano_path).convert("RGB")
         self.W, self.H = self.image_base.size
         # If display width not provided, default to full image width for maximum resolution
         self.base_display_width_px = int(display_width_px) if display_width_px else int(self.W)
@@ -71,6 +96,12 @@ class CalibrationUI:
         self.pending_geo: Optional[Tuple[float, float]] = None
         self.pairs: List[CalibPair] = []
         self.markers: List[Marker] = []
+        # Projection/intrinsics (for perspective, optional)
+        self.projection = str(projection).strip().lower()
+        self.fx_px = float(fx_px) if fx_px is not None else None
+        self.fy_px = float(fy_px) if fy_px is not None else None
+        self.cx_px = float(cx_px) if cx_px is not None else None
+        self.cy_px = float(cy_px) if cy_px is not None else None
         # Pan state for drag-to-pan
         self.pan_x_px: float = 0.0
         self.pan_y_px: float = 0.0
@@ -88,9 +119,18 @@ class CalibrationUI:
         self.status = widgets.HTML(value="")
         self.alt_input = widgets.FloatText(value=default_alt_m if default_alt_m is not None else 0.0, description="alt_m")
         self.fn_input = widgets.Text(value="output/calib_points.csv", description="CSV")
-        self.btn_save = widgets.Button(description="Save CSV", button_style="success")
-        self.btn_undo = widgets.Button(description="Undo last", button_style="warning")
-        self.btn_clear = widgets.Button(description="Clear all", button_style="danger")
+        self.btn_save = widgets.Button(description="Save CSV", button_style="success", tooltip="Save pairs to CSV")
+        self.btn_undo = widgets.Button(description="Undo last", button_style="warning", tooltip="Remove last pair")
+        self.btn_clear = widgets.Button(description="Clear all", button_style="danger", tooltip="Clear all pairs")
+        # Prevent truncation and excessive shrink for controls
+        try:
+            self.alt_input.layout = widgets.Layout(width="140px", min_width="120px", flex="0 0 auto")
+            self.fn_input.layout = widgets.Layout(width="320px", min_width="240px", flex="1 1 auto")
+            self.btn_save.layout = widgets.Layout(width="120px", min_width="110px", flex="0 0 auto")
+            self.btn_undo.layout = widgets.Layout(width="110px", min_width="100px", flex="0 0 auto")
+            self.btn_clear.layout = widgets.Layout(width="110px", min_width="100px", flex="0 0 auto")
+        except Exception:
+            pass
 
         # Mode toggle
         self.mode_toggle = widgets.ToggleButtons(
@@ -106,6 +146,10 @@ class CalibrationUI:
                 value=1.0, min=0.25, max=6.0, step=0.01, description="Zoom", readout_format=".2f"
             )
             self.zoom_slider.observe(self._on_zoom_change, names="value")
+            try:
+                self.zoom_slider.layout = widgets.Layout(width="220px", min_width="200px", flex="0 0 auto")
+            except Exception:
+                pass
         else:
             self.zoom_slider = None
 
@@ -190,6 +234,17 @@ class CalibrationUI:
         if self.enable_zoom and self.zoom_slider is not None:
             controls_children.append(self.zoom_slider)
         controls = widgets.HBox(controls_children)
+        try:
+            # Allow wrapping so buttons are not squeezed; maintain readable gaps
+            controls.layout = widgets.Layout(
+                flex_flow="row wrap",
+                align_items="center",
+                justify_content="flex-start",
+                column_gap="8px",
+                row_gap="6px",
+            )
+        except Exception:
+            pass
         # Vertical layout: image on top, map below
         self.ui = widgets.VBox([
             widgets.HTML(value=f"<b>Image:</b> click to pick pixel; <b>Map:</b> click to pick geo. A pair is added when both are set."),
@@ -333,7 +388,22 @@ class CalibrationUI:
         lon, lat = self.pending_geo
         alt_m = float(self.alt_input.value) if self.alt_input.value is not None else None
         self.pairs.append(CalibPair(u_px=float(u), v_px=float(v), lon=float(lon), lat=float(lat), W=self.W, H=self.H, alt_m=alt_m))
-        self._log(f"Added pair #{len(self.pairs)}  (u={u:.1f}, v={v:.1f}) ↔ (lon={lon:.6f}, lat={lat:.6f}, alt={alt_m})")
+        idx = len(self.pairs)
+        self._log(f"Added pair #{idx}  (u={u:.1f}, v={v:.1f}) ↔ (lon={lon:.6f}, lat={lat:.6f}, alt={alt_m})")
+        # Label the last map marker with its ID
+        try:
+            if self.markers:
+                m = self.markers[-1]
+                # Always-visible label with DivIcon if available
+                if DivIcon is not None:
+                    html = f'<div style="background:rgba(229,57,53,0.95);color:#fff;border-radius:10px;padding:2px 6px;font-size:12px;border:1px solid #b71c1c;transform:translate(-50%,-130%);">#{idx}</div>'
+                    m.icon = DivIcon(html=html, icon_size=[24, 24], icon_anchor=[12, 12])
+                else:
+                    # Fallback to popup-only label
+                    from ipywidgets import HTML as _HTML
+                    m.popup = _HTML(f"#{idx}")
+        except Exception:
+            pass
         self.pending_pixel, self.pending_geo = None, None
         self._set_status()
         self._update_image_widget()
@@ -355,6 +425,17 @@ class CalibrationUI:
             }
             if p.alt_m is not None:
                 row["alt_m"] = p.alt_m
+            # Attach projection/intrinsics constants for convenience
+            row["projection"] = self.projection
+            if self.projection == "perspective":
+                if self.fx_px is not None:
+                    row["fx_px"] = self.fx_px
+                if self.fy_px is not None:
+                    row["fy_px"] = self.fy_px
+                if self.cx_px is not None:
+                    row["cx_px"] = self.cx_px
+                if self.cy_px is not None:
+                    row["cy_px"] = self.cy_px
             rows.append(row)
         df = pd.DataFrame(rows)
         out_path = os.path.abspath(self.fn_input.value)
@@ -378,17 +459,32 @@ class CalibrationUI:
         self._update_image_widget()
 
     def _on_undo(self, _):
-        if not self.pairs:
+        # 1) If there is a pending map click (a marker without a committed pair), remove that marker
+        if self.pending_geo is not None or (len(self.markers) > len(self.pairs)):
+            if self.markers:
+                m = self.markers.pop()
+                try:
+                    self.map.remove_layer(m)
+                except Exception:
+                    pass
+            self.pending_geo = None
+            self._log("Removed pending map point.")
+        # 2) Else if there is a pending pixel selection, clear it
+        elif self.pending_pixel is not None:
+            self.pending_pixel = None
+            self._log("Cleared pending pixel selection.")
+        # 3) Else remove the last committed pair and its marker
+        elif self.pairs:
+            self.pairs.pop()
+            if self.markers:
+                m = self.markers.pop()
+                try:
+                    self.map.remove_layer(m)
+                except Exception:
+                    pass
+            self._log("Removed last pair.")
+        else:
             self._log("Nothing to undo.")
-            return
-        self.pairs.pop()
-        if self.markers:
-            m = self.markers.pop()
-            try:
-                self.map.remove_layer(m)
-            except Exception:
-                pass
-        self._log("Removed last pair.")
         self._set_status()
         self._update_image_widget()
 
@@ -442,10 +538,25 @@ class CalibrationUI:
             draw.ellipse([x - (r - 2), y - (r - 2), x + (r - 2), y + (r - 2)], fill=color_fill)
 
         # Confirmed pairs
-        for p in self.pairs:
+        for idx, p in enumerate(self.pairs, start=1):
             xd = (p.u_px / self.W) * self.display_width_px
             yd = (p.v_px / self.H) * self.display_height_px
             _draw_dot(xd, yd, color_outline="#ffffff", color_fill="#e53935", r=7)
+            # Draw numeric ID near the dot
+            try:
+                font_size = max(10, int(self.display_height_px / 60))
+                try:
+                    font = ImageFont.truetype("arial.ttf", font_size)
+                except Exception:
+                    font = ImageFont.load_default()
+                label = str(idx)
+                tw, th = draw.textbbox((0, 0), label, font=font)[2:]
+                tx = int(round(xd + 8))
+                ty = int(round(yd - th - 4))
+                draw.text((tx + 1, ty + 1), label, fill="#000000", font=font)
+                draw.text((tx, ty), label, fill="#ffffff", font=font)
+            except Exception:
+                pass
 
         # Pending pixel (if any)
         if self.pending_pixel is not None:
@@ -521,11 +632,16 @@ def launch_calibration_ui(
     default_alt_m: Optional[float] = None,
     enable_zoom: bool = True,
     image_viewport_height_px: int = 480,
+    projection: str = "pano",
+    fx_px: Optional[float] = None,
+    fy_px: Optional[float] = None,
+    cx_px: Optional[float] = None,
+    cy_px: Optional[float] = None,
 ) -> CalibrationUI:
     """
     Launch an interactive calibration UI inside Jupyter.
 
-    - Click on the panoramic image to select pixel coordinates (u_px, v_px)
+    - Click on the image (panorama or perspective) or first frame of a video to select pixel coordinates (u_px, v_px)
     - Click on the map to select geographic coordinates (lon, lat)
     - When both are set, a pair is recorded automatically
     - Save pairs to a CSV compatible with solve_calibration
@@ -540,6 +656,11 @@ def launch_calibration_ui(
         default_alt_m=default_alt_m,
         enable_zoom=enable_zoom,
         image_viewport_height_px=image_viewport_height_px,
+        projection=projection,
+        fx_px=fx_px,
+        fy_px=fy_px,
+        cx_px=cx_px,
+        cy_px=cy_px,
     )
     return ui
 
