@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import os
 from typing import Optional, List, Tuple
+import json
+from urllib import request as _urlreq  # stdlib only
+from urllib import error as _urlerr
 
 import numpy as np
 import pandas as pd
@@ -49,15 +52,71 @@ except Exception:  # pragma: no cover
     h3 = None  # type: ignore
 
 
-def _get_provider(provider: str):
+_GOOGLE_SESSION_CACHE = {
+    "token": None,        # type: ignore
+    "expires": None,      # type: ignore
+    "map_type": None,     # type: ignore
+}
+
+
+def _google_create_session_once(api_key: str, map_type: str = "satellite") -> Optional[str]:
+    """
+    Create a Google Map Tiles API session token once per process and reuse it.
+    Returns the session token string or None on failure.
+    """
+    try:
+        # Reuse cached token if same map_type; naive cache (no TTL checking)
+        if _GOOGLE_SESSION_CACHE.get("token") and _GOOGLE_SESSION_CACHE.get("map_type") == map_type:
+            return _GOOGLE_SESSION_CACHE["token"]  # type: ignore[return-value]
+        url = f"https://tile.googleapis.com/v1/createSession?key={api_key}"
+        payload = {
+            "mapType": map_type,
+            # Optional: language/region/scale, defaults are OK for most cases
+        }
+        data = json.dumps(payload).encode("utf-8")
+        req = _urlreq.Request(url=url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+        with _urlreq.urlopen(req, timeout=10) as resp:
+            body = resp.read().decode("utf-8")
+            obj = json.loads(body)
+            token = obj.get("session")
+            if token:
+                _GOOGLE_SESSION_CACHE["token"] = token
+                _GOOGLE_SESSION_CACHE["map_type"] = map_type
+                try:
+                    print("[basemap] Created Google Map Tiles session token")
+                except Exception:
+                    pass
+                return str(token)
+    except _urlerr.HTTPError as e:
+        try:
+            print(f"[basemap] Google createSession HTTPError: {e.code} {e.reason}")
+        except Exception:
+            pass
+    except _urlerr.URLError as e:
+        try:
+            print(f"[basemap] Google createSession URLError: {e.reason}")
+        except Exception:
+            pass
+    except Exception as e:
+        try:
+            print(f"[basemap] Google createSession error: {e}")
+        except Exception:
+            pass
+    return None
+
+def _get_provider(provider: str, api_key: Optional[str] = None):
     """
     Resolve a basemap provider for contextily.add_basemap.
 
     Supports:
       - "carto" (CartoDB Positron)
       - "osm" (OpenStreetMap Mapnik)
-      - "google" / "google-satellite" (Google Satellite via XYZ tiles)
+      - "google" / "google-satellite" (Google Satellite via Google Map Tiles API if api_key provided; otherwise falls back to Esri WorldImagery)
       - Any custom XYZ URL starting with http(s)://
+
+    Notes on Google Satellite:
+      - If api_key is provided (or environment variable GOOGLE_MAPS_API_KEY is set), uses Google Map Tiles API.
+      - If no api_key is available, falls back to Esri.WorldImagery for reliability.
     """
     if cx is None:
         raise RuntimeError("contextily not installed; install with `pip install panogeo[geo]`")
@@ -67,8 +126,43 @@ def _get_provider(provider: str):
         return cx.providers.CartoDB.Positron
     if p in ("osm", "openstreetmap", "mapnik"):
         return cx.providers.OpenStreetMap.Mapnik
-    # Use Esri World Imagery as a reliable satellite source (Google tiles often 404)
     if p in ("google", "google-satellite", "google_satellite", "g_sat", "esri", "esri-world", "worldimagery", "satellite"):
+        # Prefer Google Map Tiles API when API key available; else fall back to Esri World Imagery
+        key = api_key or os.environ.get("GOOGLE_MAPS_API_KEY")
+        if key and p not in ("esri", "esri-world", "worldimagery"):
+            # Google Map Tiles API for raster tiles requires a session token via createSession.
+            # We create a short-lived session and build 2dtiles URL with z/x/y path parameters.
+            session_token = _google_create_session_once(key, map_type="satellite")
+            if session_token is not None:
+                url = f"https://tile.googleapis.com/v1/2dtiles/{{z}}/{{x}}/{{y}}?session={session_token}&key={key}"
+                if TileProvider is not None:
+                    tp = TileProvider(
+                        name="Google Satellite",
+                        url=url,
+                        attribution="© Google",
+                        min_zoom=0,
+                        max_zoom=22,
+                    )
+                    try:
+                        print("[basemap] Using Google Satellite (Map Tiles API, session-based, 2dtiles z/x/y)")
+                    except Exception:
+                        pass
+                    return tp
+                try:
+                    print("[basemap] Using Google Satellite (raw 2dtiles URL with session)")
+                except Exception:
+                    pass
+                return url
+            else:
+                try:
+                    print("[basemap] Google createSession failed; falling back to Esri World Imagery")
+                except Exception:
+                    pass
+        # Fallback: Esri World Imagery (robust free imagery)
+        try:
+            print("[basemap] Falling back to Esri World Imagery (no/invalid Google API key)")
+        except Exception:
+            pass
         return cx.providers.Esri.WorldImagery
     # Japan GSI seamless photo tiles (primary key: japan_gsi_seamless). Keep legacy aliases.
     if p in ("japan_gsi_seamless", "japan_gsi", "gsi", "gsi-seamlessphoto", "gsi_seamlessphoto", "seamlessphoto", "gsi-seamless"):
@@ -107,6 +201,7 @@ def save_points_basemap(
     out_png: str,
     provider: str = "carto",
     zoom: Optional[int] = None,
+    api_key: Optional[str] = None,
     point_size: float = 12.0,
     alpha: float = 0.9,
     point_color: str = "#9A0EEA",
@@ -129,6 +224,9 @@ def save_points_basemap(
         Basemap provider: 'carto', 'osm', 'google', or an XYZ URL.
     zoom : Optional[int]
         Explicit tile zoom. If None, contextily chooses based on extent.
+    api_key : Optional[str]
+        When provider is 'google'/'google-satellite', an API key for Google Map Tiles API.
+        If omitted, environment variable 'GOOGLE_MAPS_API_KEY' is used if present.
     point_size : float
         Base point size in pixels (approx.).
     alpha : float
@@ -208,7 +306,7 @@ def save_points_basemap(
     def _add_basemap_with_fallback(ax, provider_name: str, requested_zoom):
         last_err = None
         # Try primary provider, decreasing zoom a few times
-        src_obj = _get_provider(provider_name)
+        src_obj = _get_provider(provider_name, api_key=api_key)
         z = _resolve_zoom(src_obj, requested_zoom)
         for _ in range(5):
             try:
@@ -217,12 +315,20 @@ def save_points_basemap(
             except Exception as e:
                 last_err = e
                 z = max(2, z - 1)
+        try:
+            print(f"[basemap] Primary provider '{provider_name}' failed; attempting fallbacks (last error: {last_err})")
+        except Exception:
+            pass
         # Fallback providers
         for fb in ("esri-world", "carto", "osm"):
             try:
-                src_fb = _get_provider(fb)
+                src_fb = _get_provider(fb, api_key=api_key)
                 z = _resolve_zoom(src_fb, requested_zoom)
                 cx.add_basemap(ax, source=src_fb, crs="EPSG:3857", zoom=z, attribution=True, reset_extent=False)
+                try:
+                    print(f"[basemap] Fallback provider used: '{fb}'")
+                except Exception:
+                    pass
                 return
             except Exception as e2:
                 last_err = e2
@@ -272,6 +378,7 @@ def save_all_images_basemap(
     out_dir: str,
     provider: str = "carto",
     zoom: Optional[int] = None,
+    api_key: Optional[str] = None,
     point_size: float = 12.0,
     alpha: float = 0.9,
     point_color: str = "#9A0EEA",
@@ -328,6 +435,7 @@ def save_all_images_basemap(
             out_png=out_png,
             provider=provider,
             zoom=zoom,
+            api_key=api_key,
             point_size=point_size,
             alpha=alpha,
             point_color=point_color,
@@ -383,6 +491,7 @@ def save_h3_basemap(
     out_png: str,
     provider: str = "carto",
     zoom: Optional[int] = None,
+    api_key: Optional[str] = None,
     h3_res: int = 10,
     weight_col: Optional[str] = None,
     alpha: float = 0.85,
@@ -478,8 +587,48 @@ def save_h3_basemap(
     ax.set_xlim(extent[0], extent[1])
     ax.set_ylim(extent[2], extent[3])
     ax.set_aspect("equal", adjustable="box")
-    src = _get_provider(provider)
-    cx.add_basemap(ax, source=src, crs="EPSG:3857", zoom=zoom, attribution=True, reset_extent=False)
+    # Add basemap with simple fallback (align behavior with points/video)
+    def _resolve_zoom(src_obj, requested):
+        if requested is not None:
+            try:
+                return int(requested)
+            except Exception:
+                pass
+        try:
+            z = int(getattr(src_obj, "max_zoom", 18)) - 1
+            return max(2, z)
+        except Exception:
+            return 17
+    last_err = None
+    src_obj = _get_provider(provider, api_key=api_key)
+    z = _resolve_zoom(src_obj, zoom)
+    for _ in range(5):
+        try:
+            cx.add_basemap(ax, source=src_obj, crs="EPSG:3857", zoom=z, attribution=True, reset_extent=False)
+            break
+        except Exception as e:
+            last_err = e
+            z = max(2, z - 1)
+    else:
+        try:
+            print(f"[basemap] Primary provider '{provider}' failed for H3 plot; trying fallbacks (last error: {last_err})")
+        except Exception:
+            pass
+        for fb in ("esri-world", "carto", "osm"):
+            try:
+                src_fb = _get_provider(fb, api_key=api_key)
+                z = _resolve_zoom(src_fb, zoom)
+                cx.add_basemap(ax, source=src_fb, crs="EPSG:3857", zoom=z, attribution=True, reset_extent=False)
+                last_err = None
+                try:
+                    print(f"[basemap] Fallback provider used for H3 plot: '{fb}'")
+                except Exception:
+                    pass
+                break
+            except Exception as e2:
+                last_err = e2
+        if last_err is not None:
+            raise last_err
     ax.set_xlim(extent[0], extent[1])
     ax.set_ylim(extent[2], extent[3])
     ax.set_aspect("equal", adjustable="box")
@@ -544,6 +693,7 @@ def save_tracking_map_video(
     out_mp4: str,
     provider: str = "carto",
     zoom: Optional[int] = None,
+    api_key: Optional[str] = None,
     point_size: float = 16.0,
     alpha: float = 0.95,
     traj_max_frames: int = 60,
@@ -625,7 +775,7 @@ def save_tracking_map_video(
 
         def _add_basemap_with_fallback(ax, provider_name: str, requested_zoom):
             last_err = None
-            src_obj = _get_provider(provider_name)
+            src_obj = _get_provider(provider_name, api_key=api_key)
             z = _resolve_zoom(src_obj, requested_zoom)
             for _ in range(5):
                 try:
@@ -634,11 +784,19 @@ def save_tracking_map_video(
                 except Exception as e:
                     last_err = e
                     z = max(2, z - 1)
+            try:
+                print(f"[basemap] Primary provider '{provider_name}' failed in video; trying fallbacks (last error: {last_err})")
+            except Exception:
+                pass
             for fb in ("esri-world", "carto", "osm"):
                 try:
-                    src_fb = _get_provider(fb)
+                    src_fb = _get_provider(fb, api_key=api_key)
                     z = _resolve_zoom(src_fb, requested_zoom)
                     cx.add_basemap(ax, source=src_fb, crs="EPSG:3857", zoom=z, attribution=False, reset_extent=False)
+                    try:
+                        print(f"[basemap] Fallback provider used in video: '{fb}'")
+                    except Exception:
+                        pass
                     return
                 except Exception as e2:
                     last_err = e2
@@ -648,7 +806,7 @@ def save_tracking_map_video(
         # Try to prefetch basemap once for the fixed extent to speed up rendering
         prefetched_basemap = None
         try:
-            src_obj = _get_provider(provider)
+            src_obj = _get_provider(provider, api_key=api_key)
             z0 = _resolve_zoom(src_obj, zoom)
             if cx_tile is not None:
                 # cx_tile.bounds2img expects (west, south, east, north)
@@ -665,7 +823,43 @@ def save_tracking_map_video(
                     img_np = img_np[:, :, :3]
                 prefetched_basemap = (img_np, ext_bounds)
         except Exception:
+            try:
+                print("[basemap] Prefetch via bounds2img failed; will fetch tiles per-frame")
+            except Exception:
+                pass
             prefetched_basemap = None
+        # Fallback pre-render: draw basemap once into an offscreen figure and reuse it
+        if prefetched_basemap is None:
+            try:
+                tmp_fig = plt.figure(figsize=(fig_w, fig_h))
+                tmp_ax = tmp_fig.add_axes([0.0, 0.0, 1.0, 1.0])
+                tmp_ax.set_axis_off()
+                tmp_ax.set_xlim(extent[0], extent[1])
+                tmp_ax.set_ylim(extent[2], extent[3])
+                tmp_ax.set_aspect("equal", adjustable="box")
+                _add_basemap_with_fallback(tmp_ax, provider, zoom)
+                tmp_fig.canvas.draw()
+                h_px_tmp = int(tmp_fig.canvas.get_width_height()[1])
+                w_px_tmp = int(tmp_fig.canvas.get_width_height()[0])
+                try:
+                    buf_tmp = tmp_fig.canvas.buffer_rgba()
+                    img_rgba_tmp = np.frombuffer(buf_tmp, dtype=np.uint8).reshape((h_px_tmp, w_px_tmp, 4))
+                    img_tmp = img_rgba_tmp[:, :, :3]
+                except Exception:
+                    img_tmp = np.frombuffer(getattr(tmp_fig.canvas, "tostring_rgb")(), dtype=np.uint8).reshape((h_px_tmp, w_px_tmp, 3))
+                plt.close(tmp_fig)
+                # Use the fixed extent (west, south, east, north)
+                ext_bounds_tmp = (extent[0], extent[2], extent[1], extent[3])
+                prefetched_basemap = (img_tmp, ext_bounds_tmp)
+                try:
+                    print("[basemap] Pre-rendered basemap once; reusing for all frames")
+                except Exception:
+                    pass
+            except Exception as e:
+                try:
+                    print(f"[basemap] Basemap pre-render failed; will fetch per-frame. Reason: {e}")
+                except Exception:
+                    pass
 
         # Optional progress bar
         pbar = None
