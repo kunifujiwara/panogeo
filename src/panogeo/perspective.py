@@ -135,6 +135,9 @@ def geolocate_detections_perspective(
 
     u_col = _col("u_px")
     v_col = _col("v_px")
+    # Optional crop offset columns (recorded by tracker when center_crop is used)
+    xoff_col = cols.get("x_offset_px")
+    yoff_col = cols.get("y_offset_px")
 
     H, ref_lat, ref_lon, g_alt = load_homography(homography_npz)
     if debug:
@@ -150,6 +153,23 @@ def geolocate_detections_perspective(
         else:
             print("[persp] WARNING: legacy lon/lat homography in use; re-run calibrate-persp to regenerate.")
     uv = df[[u_col, v_col]].to_numpy(dtype=np.float64)
+    # If offsets exist, convert crop-relative pixels (u,v) -> full-frame pixels expected by homography
+    if (xoff_col is not None) and (yoff_col is not None):
+        try:
+            xoff = df[xoff_col].to_numpy(dtype=np.float64)
+            yoff = df[yoff_col].to_numpy(dtype=np.float64)
+            if xoff.size == uv.shape[0] and yoff.size == uv.shape[0]:
+                uv[:, 0] += xoff
+                uv[:, 1] += yoff
+                if debug:
+                    try:
+                        ux, uy = float(np.nanmean(xoff)), float(np.nanmean(yoff))
+                        print(f"[persp] applied crop offsets: mean x_offset={ux:.1f}, y_offset={uy:.1f}")
+                    except Exception:
+                        pass
+        except Exception as _e:
+            if debug:
+                print(f"[persp] WARNING: failed applying crop offsets: {_e}")
     coords = pixel_to_geo(uv, H)
     if (ref_lat is not None) and (ref_lon is not None):
         # ENU -> lon/lat with local context

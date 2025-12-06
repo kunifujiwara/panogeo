@@ -338,6 +338,14 @@ def run_tracking(
                     "track_id": int(oid),
                     "W": int(out_w),
                     "H": int(out_h),
+                    # If center-cropping was used, record the pixel offsets so downstream
+                    # geolocation (homography defined in full-frame coordinates) can adjust.
+                    # When no crop is used, these evaluate to zero.
+                    "x_offset_px": int(x0),
+                    "y_offset_px": int(y0),
+                    # Optional provenance/debug info
+                    "SRC_W": int(src_w),
+                    "SRC_H": int(src_h),
                     "u_px": u,
                     "v_px": v,
                 })
