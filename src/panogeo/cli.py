@@ -14,6 +14,7 @@ from .calibration import solve_calibration, save_calibration
 from .geolocate import geolocate_detections
 from .perspective import solve_homography_from_csv, save_homography, geolocate_detections_perspective
 from .mapplot import save_points_basemap, save_all_images_basemap
+from .video import compose_side_by_side_video  # noqa: F401
 
 try:
     import folium
@@ -236,6 +237,16 @@ def cmd_map_png_all(args: argparse.Namespace) -> None:
         print(str(e), file=sys.stderr)
         sys.exit(2)
 
+def cmd_compose_video(args: argparse.Namespace) -> None:
+    out = compose_side_by_side_video(
+        args.left,
+        args.right,
+        args.out,
+        layout=args.layout,
+        fps=args.fps,
+        gap=int(args.gap),
+    )
+    print(f"Saved combined video: {out}")
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="panogeo", description="Panoramic detection and geolocation")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -354,6 +365,15 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--margin", type=float, default=0.10, help="fractional padding for shared extent")
     sp.add_argument("--stamp", action="store_true", help="overlay timestamp from filename on PNG maps")
     sp.set_defaults(func=cmd_map_png_all)
+
+    sp = sub.add_parser("compose-video", help="Compose two videos side-by-side or stacked")
+    sp.add_argument("--left", required=True, help="Left (or top) video path, e.g., camera video with trajectories")
+    sp.add_argument("--right", required=True, help="Right (or bottom) video path, e.g., map video with trajectories")
+    sp.add_argument("--out", required=True, help="Output mp4 path for combined video")
+    sp.add_argument("--layout", choices=["h","v"], default="h", help="Layout: 'h' (exclusive) or 'v' (stack)")
+    sp.add_argument("--fps", type=float, default=None, help="Override output FPS (default: min of inputs)")
+    sp.add_argument("--gap", type=int, default=8, help="Gap in pixels between panels")
+    sp.set_defaults(func=cmd_compose_video)
 
     return p
 

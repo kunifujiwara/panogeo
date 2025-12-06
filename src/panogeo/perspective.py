@@ -113,6 +113,8 @@ def geolocate_detections_perspective(
     calib_csv: Optional[str] = None,
     gate_margin_m: float = 150.0,
     drop_outside: bool = True,
+    show_progress: bool = False,
+    progress_desc: Optional[str] = None,
 ) -> Tuple[str, str]:
     """
     Geolocate bottom-center detection points from a detections CSV using a pixel->geo homography.
@@ -156,12 +158,32 @@ def geolocate_detections_perspective(
         lats = []
         east = []
         north = []
-        for e, n in coords:
+        total = int(coords.shape[0])
+        pbar = None
+        if show_progress:
+            try:
+                from tqdm import tqdm  # type: ignore
+                pbar = tqdm(total=total, desc=(progress_desc or "geolocate-persp"), unit="pt")
+            except Exception:
+                pbar = None
+        for idx, (e, n) in enumerate(coords, start=1):
             lon, lat, _h = enu_to_llh(ctx, float(e), float(n), 0.0)
             lons.append(lon)
             lats.append(lat)
             east.append(float(e))
             north.append(float(n))
+            if pbar is not None:
+                pbar.update(1)
+            elif show_progress and (idx % 10000 == 0 or idx == total):
+                try:
+                    print(f"[geolocate-persp] {idx}/{total}", flush=True)
+                except Exception:
+                    pass
+        if pbar is not None:
+            try:
+                pbar.close()
+            except Exception:
+                pass
         df["lon"] = lons
         df["lat"] = lats
         df["east_m"] = east

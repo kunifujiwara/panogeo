@@ -70,6 +70,8 @@ def geolocate_detections(
     dem_path: Optional[str] = None,
     max_range_m: float = 80.0,
     step_m: float = 1.0,
+    show_progress: bool = False,
+    progress_desc: Optional[str] = None,
 ) -> Tuple[str, str]:
     os.makedirs(output_dir, exist_ok=True)
     det = pd.read_csv(detections_csv)
@@ -126,7 +128,15 @@ def geolocate_detections(
             return E, N, U, lon, lat, calib.ground_alt_m, rng
 
     east, north, up, lons, lats, rngs = [], [], [], [], [], []
-    for r in det.itertuples():
+    total = int(len(det))
+    pbar = None
+    if show_progress:
+        try:
+            from tqdm import tqdm  # type: ignore
+            pbar = tqdm(total=total, desc=(progress_desc or "geolocate"), unit="pt")
+        except Exception:
+            pbar = None
+    for idx, r in enumerate(det.itertuples(), start=1):
         hit = intersect(float(r.u_px), float(r.v_px), int(r.W), int(r.H))
         if hit is None:
             east.append(np.nan); north.append(np.nan); up.append(np.nan)
@@ -135,6 +145,18 @@ def geolocate_detections(
             E, N, U, Lon, Lat, Th, R = hit
             east.append(E); north.append(N); up.append(U)
             lons.append(Lon); lats.append(Lat); rngs.append(R)
+        if pbar is not None:
+            pbar.update(1)
+        elif show_progress and (idx % 1000 == 0 or idx == total):
+            try:
+                print(f"[geolocate] {idx}/{total}", flush=True)
+            except Exception:
+                pass
+    if pbar is not None:
+        try:
+            pbar.close()
+        except Exception:
+            pass
 
     det["east_m"] = east
     det["north_m"] = north

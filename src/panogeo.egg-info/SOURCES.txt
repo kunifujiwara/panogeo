@@ -12,6 +12,7 @@ src/panogeo/people_tracking.py
 src/panogeo/perspective.py
 src/panogeo/ui.py
 src/panogeo/utils.py
+src/panogeo/video.py
 src/panogeo.egg-info/PKG-INFO
 src/panogeo.egg-info/SOURCES.txt
 src/panogeo.egg-info/dependency_links.txt
