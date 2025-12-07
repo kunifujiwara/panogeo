@@ -10,6 +10,7 @@ import cv2
 import numpy as np
 import pandas as pd
 
+from .utils import id_color_bgr
 
 # Public API
 __all__ = [
@@ -306,7 +307,7 @@ def run_tracking(
         for oid, tr in tracks.items():
             x1b, y1b, x2b, y2b = tr.bbox
             cX, cY = tr.centroid
-            color = _id_color(oid)
+            color = id_color_bgr(oid)
             cv2.rectangle(roi, (x1b, y1b), (x2b, y2b), color, 2)
             cv2.circle(roi, (cX, cY), 3, (0, 255, 255), -1)
             cv2.putText(roi, f"ID {oid}", (x1b, max(0, y1b - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
@@ -366,9 +367,7 @@ def run_tracking(
 
 
 def _id_color(oid: int) -> Tuple[int, int, int]:
-    r = (37 * oid) % 255
-    g = (17 * oid + 85) % 255
-    b = (97 * oid + 170) % 255
-    return int(b), int(g), int(r)
+    # Backwards-compat shim: delegate to shared utils
+    return id_color_bgr(oid)
 
 

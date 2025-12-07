@@ -17,7 +17,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 import matplotlib.cm as cm  # noqa: E402
 from matplotlib.colors import Normalize  # noqa: E402
 from matplotlib.ticker import MaxNLocator  # noqa: E402
-from .utils import extract_timestamp_text
+from .utils import extract_timestamp_text, id_color_rgb01
 
 try:
     import geopandas as gpd  # type: ignore
@@ -872,10 +872,7 @@ def save_tracking_map_video(
 
         # For color-coding different tracks deterministically
         def _id_color(oid: int) -> Tuple[float, float, float]:
-            r = (37 * oid) % 255
-            g = (17 * oid) % 255
-            b = (13 * oid) % 255
-            return (r / 255.0, g / 255.0, b / 255.0)
+            return id_color_rgb01(oid)
 
         for idx, f in enumerate(all_frames):
             # Collect recent history up to traj_max_frames
