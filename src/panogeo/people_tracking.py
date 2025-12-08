@@ -30,11 +30,25 @@ class Track:
 
 
 class CentroidTracker:
-    def __init__(self, max_disappeared: int = 30, max_distance: float = 110.0):
+    def __init__(
+        self,
+        max_disappeared: int = 30,
+        max_distance: float = 110.0,
+        *,
+        max_speed_px_per_frame: Optional[float] = None,
+        min_iou_for_match: float = 0.0,
+    ):
         self.next_object_id: int = 0
         self.tracks: Dict[int, Track] = {}
         self.max_disappeared = max_disappeared
         self.max_distance = max_distance
+        # Optional, tighter gating to prevent unrealistic jumps and id switches
+        # If set, a detection will only be matched to a track if the centroid
+        # move does not exceed (max_speed_px_per_frame * frames_since_update).
+        self.max_speed_px_per_frame = max_speed_px_per_frame
+        # Optional IoU gating; when > 0, require at least this IoU between
+        # previous track bbox and candidate detection.
+        self.min_iou_for_match = float(min_iou_for_match)
 
     def register(self, centroid: Tuple[int, int], bbox: Tuple[int, int, int, int]) -> None:
         self.tracks[self.next_object_id] = Track(
@@ -73,6 +87,27 @@ class CentroidTracker:
 
         D = np.linalg.norm(object_centroids[:, None, :] - input_centroids[None, :, :], axis=2)
 
+        # Optional IoU matrix for gating
+        IoU = None
+        if self.min_iou_for_match > 0.0:
+            IoU = np.zeros_like(D, dtype=np.float32)
+            track_bboxes = [self.tracks[oid].bbox for oid in object_ids]
+            for r, tb in enumerate(track_bboxes):
+                x1t, y1t, x2t, y2t = tb
+                at = float(max(0, x2t - x1t)) * float(max(0, y2t - y1t))
+                for c, db in enumerate(rects):
+                    x1d, y1d, x2d, y2d = db
+                    inter_x1 = max(x1t, x1d)
+                    inter_y1 = max(y1t, y1d)
+                    inter_x2 = min(x2t, x2d)
+                    inter_y2 = min(y2t, y2d)
+                    iw = max(0, inter_x2 - inter_x1)
+                    ih = max(0, inter_y2 - inter_y1)
+                    inter = float(iw * ih)
+                    ad = float(max(0, x2d - x1d)) * float(max(0, y2d - y1d))
+                    union = at + ad - inter if (at + ad - inter) > 0 else 0.0
+                    IoU[r, c] = inter / union if union > 0 else 0.0
+
         rows = D.min(axis=1).argsort()
         cols = D.argmin(axis=1)[rows]
 
@@ -83,6 +118,15 @@ class CentroidTracker:
             if row in used_rows or col in used_cols:
                 continue
             if D[row, col] > self.max_distance:
+                continue
+            # Speed gating: forbid unrealistic jumps
+            if self.max_speed_px_per_frame is not None:
+                frames_since_update = self.tracks[object_ids[row]].disappeared + 1
+                max_allow = self.max_speed_px_per_frame * max(1, frames_since_update)
+                if D[row, col] > max_allow:
+                    continue
+            # IoU gating: require overlap if requested
+            if IoU is not None and IoU[row, col] < self.min_iou_for_match:
                 continue
 
             object_id = object_ids[row]
@@ -165,6 +209,8 @@ def run_tracking(
     traj_thickness: int = 2,
     max_disappeared: int = 30,
     max_distance: float = 110.0,
+    max_speed_px_per_frame: Optional[float] = None,
+    min_iou_for_match: float = 0.0,
     progress_callback: Optional[Callable[[int, Optional[int]], None]] = None,
     show_progress: bool = True,
     progress_desc: Optional[str] = None,
@@ -213,7 +259,12 @@ def run_tracking(
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(str(output_path), fourcc, fps, (out_w, out_h))
 
-    tracker = CentroidTracker(max_disappeared=max_disappeared, max_distance=max_distance)
+    tracker = CentroidTracker(
+        max_disappeared=max_disappeared,
+        max_distance=max_distance,
+        max_speed_px_per_frame=max_speed_px_per_frame,
+        min_iou_for_match=min_iou_for_match,
+    )
     prev_centroids: Dict[int, Tuple[int, int]] = {}
 
     tracks_history: Dict[int, Deque[Tuple[int, int]]] = {}
