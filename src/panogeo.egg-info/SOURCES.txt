@@ -3,6 +3,7 @@ pyproject.toml
 src/panogeo/__init__.py
 src/panogeo/calibration.py
 src/panogeo/cli.py
+src/panogeo/dem_gml.py
 src/panogeo/detection.py
 src/panogeo/geodesy.py
 src/panogeo/geolocate.py

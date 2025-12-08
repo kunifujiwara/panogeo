@@ -13,6 +13,7 @@ except Exception:  # pragma: no cover
     cv2 = None  # type: ignore
 
 from .geodesy import build_context, enu_to_llh, enu_basis, llh_to_ecef  # type: ignore
+from .dem_gml import build_enu_dem_grid_from_folder_around_calib  # type: ignore
 from pyproj import CRS, Transformer  # type: ignore
 
 try:
@@ -230,6 +231,55 @@ def _recompute_h_with_plane(
     return H.astype(np.float64), P0.astype(np.float64), u_hat.astype(np.float64), v_hat.astype(np.float64)
 
 
+def _recompute_h_with_plane_given_elev(
+    df: pd.DataFrame,
+    ref_lat: float,
+    ref_lon: float,
+    elev_m: np.ndarray,
+    ransac_thresh_m: float,
+) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+    """
+    Same as _recompute_h_with_plane, but elevations are provided externally.
+    """
+    cols = {c.lower(): c for c in df.columns}
+    try:
+        u_col = cols["u_px"]
+        v_col = cols["v_px"]
+        lon_col = cols["lon"]
+        lat_col = cols["lat"]
+    except Exception:
+        return None
+    src = df[[u_col, v_col]].to_numpy(dtype=np.float32)
+    if src.shape[0] < 4:
+        return None
+    lons = df[lon_col].astype(float).to_numpy()
+    lats = df[lat_col].astype(float).to_numpy()
+    if elev_m.shape[0] != lons.shape[0]:
+        return None
+    # Build ENU 3D for points
+    ecef_from_llh = _ecef_transformer()
+    ecef_ref = llh_to_ecef(ref_lon, ref_lat, 0.0, ecef_from_llh)
+    R_ecef2enu = enu_basis(ref_lat, ref_lon)
+    P_enu: list[list[float]] = []
+    for lo, la, h in zip(lons, lats, elev_m):
+        X = llh_to_ecef(float(lo), float(la), float(h), ecef_from_llh)
+        v_ecef = X - ecef_ref
+        v_enu = R_ecef2enu @ v_ecef
+        P_enu.append([float(v_enu[0]), float(v_enu[1]), float(v_enu[2])])
+    P = np.asarray(P_enu, dtype=float)
+    fit = _fit_plane_least_squares(P[:, 0], P[:, 1], P[:, 2])
+    if fit is None:
+        return None
+    a, b, c = fit
+    P0, u_hat, v_hat = _build_plane_basis(a, b, c)
+    XY = _project_points_to_plane_xy(P, P0, u_hat, v_hat).astype(np.float32)
+    _require_cv2()
+    H, _status = cv2.findHomography(src, XY, method=cv2.RANSAC, ransacReprojThreshold=float(max(0.1, ransac_thresh_m)))
+    if H is None:
+        return None
+    return H.astype(np.float64), P0.astype(np.float64), u_hat.astype(np.float64), v_hat.astype(np.float64)
+
+
 def _sample_dem_grid_around_calib(
     df: pd.DataFrame,
     ref_lat: float,
@@ -347,6 +397,7 @@ def save_homography(
     ground_alt_m: float = 0.0,
     calib_csv: Optional[str] = None,
     google_api_key: Optional[str] = None,
+    dem_xml_folder: Optional[str] = None,
     dem_rows: Optional[int] = None,
     dem_cols: Optional[int] = None,
     dem_margin_m: float = 120.0,
@@ -367,27 +418,71 @@ def save_homography(
         except Exception:
             df = None  # type: ignore
         if df is not None and len(df) >= 4:
-            plane_res = _recompute_h_with_plane(df, float(ref_lat), float(ref_lon), ransac_thresh_m=10.0, google_api_key=google_api_key)
-            if plane_res is not None:
-                H_to_save, P0, u_hat, v_hat = plane_res
-            # Optionally sample a DEM grid for non-planar terrain usage
-            # Sample DEM either by explicit rows/cols or by target spacing in meters
-            if (
-                (dem_spacing_m is not None and float(dem_spacing_m) > 0)
-                or (dem_rows is not None and dem_cols is not None and dem_rows >= 2 and dem_cols >= 2)
-            ):
-                dem = _sample_dem_grid_around_calib(
-                    df,
-                    float(ref_lat),
-                    float(ref_lon),
-                    float(dem_margin_m),
-                    int(dem_rows) if dem_rows is not None else None,
-                    int(dem_cols) if dem_cols is not None else None,
-                    google_api_key,
-                    float(dem_spacing_m) if dem_spacing_m is not None else None,
-                )
-                if dem is not None:
-                    N_axis, E_axis, ELEV = dem
+            # Prefer local DEM if provided; otherwise fall back to Google Elevation (if API key present)
+            used_local_dem = False
+            if dem_xml_folder is not None:
+                try:
+                    from pathlib import Path as _Path  # local import to avoid top-level dependency
+                    built = build_enu_dem_grid_from_folder_around_calib(
+                        df,
+                        float(ref_lat),
+                        float(ref_lon),
+                        _Path(str(dem_xml_folder)),
+                        margin_m=float(dem_margin_m),
+                        dem_spacing_m=float(dem_spacing_m) if dem_spacing_m is not None else None,
+                    )
+                    if built is not None:
+                        N_axis, E_axis, ELEV = built
+                        # Use DEM elevations at calibration points to fit plane-refined H
+                        # Compute EN for calib points to interpolate U from DEM grid
+                        cols = {c.lower(): c for c in df.columns}
+                        lon_col = cols.get("lon")
+                        lat_col = cols.get("lat")
+                        if (lon_col is not None) and (lat_col is not None):
+                            lons = df[lon_col].astype(float).to_numpy()
+                            lats = df[lat_col].astype(float).to_numpy()
+                            # Convert to EN in same local frame
+                            ecef_from_llh = _ecef_transformer()
+                            ecef_ref = llh_to_ecef(float(ref_lon), float(ref_lat), 0.0, ecef_from_llh)
+                            R_ecef2enu = enu_basis(float(ref_lat), float(ref_lon))
+                            e_list = []
+                            n_list = []
+                            for lo, la in zip(lons, lats):
+                                X = llh_to_ecef(float(lo), float(la), 0.0, ecef_from_llh)
+                                v_ecef = X - ecef_ref
+                                v_enu = R_ecef2enu @ v_ecef
+                                e_list.append(float(v_enu[0]))
+                                n_list.append(float(v_enu[1]))
+                            e_arr = np.asarray(e_list, dtype=float)
+                            n_arr = np.asarray(n_list, dtype=float)
+                            elev_interp = _interp_bilinear(e_arr, n_arr, N_axis, E_axis, ELEV)
+                            plane_res = _recompute_h_with_plane_given_elev(df, float(ref_lat), float(ref_lon), elev_interp, ransac_thresh_m=10.0)
+                            if plane_res is not None:
+                                H_to_save, P0, u_hat, v_hat = plane_res
+                                used_local_dem = True
+                except Exception:
+                    used_local_dem = False
+            if not used_local_dem:
+                plane_res = _recompute_h_with_plane(df, float(ref_lat), float(ref_lon), ransac_thresh_m=10.0, google_api_key=google_api_key)
+                if plane_res is not None:
+                    H_to_save, P0, u_hat, v_hat = plane_res
+                # Optional DEM grid via Google API sampling (legacy)
+                if (
+                    (dem_spacing_m is not None and float(dem_spacing_m) > 0)
+                    or (dem_rows is not None and dem_cols is not None and dem_rows >= 2 and dem_cols >= 2)
+                ):
+                    dem = _sample_dem_grid_around_calib(
+                        df,
+                        float(ref_lat),
+                        float(ref_lon),
+                        float(dem_margin_m),
+                        int(dem_rows) if dem_rows is not None else None,
+                        int(dem_cols) if dem_cols is not None else None,
+                        google_api_key,
+                        float(dem_spacing_m) if dem_spacing_m is not None else None,
+                    )
+                    if dem is not None:
+                        N_axis, E_axis, ELEV = dem
     if P0 is not None and u_hat is not None and v_hat is not None:
         np.savez(
             npz_path,
@@ -508,6 +603,9 @@ def geolocate_detections_perspective(
     drop_outside: bool = True,
     show_progress: bool = False,
     progress_desc: Optional[str] = None,
+    dem_xml_folder: Optional[str] = None,
+    dem_margin_m: float = 120.0,
+    dem_spacing_m: Optional[float] = None,
 ) -> Tuple[str, str]:
     """
     Geolocate bottom-center detection points from a detections CSV using a pixel->geo homography.
@@ -588,6 +686,55 @@ def geolocate_detections_perspective(
                 pbar = tqdm(total=total, desc=(progress_desc or "geolocate-persp"), unit="pt")
             except Exception:
                 pbar = None
+        # If DEM grid missing but local DEM folder provided, build one covering detection extent
+        if (N_axis is None or E_axis is None or ELEV is None) and (dem_xml_folder is not None):
+            try:
+                from pathlib import Path as _Path
+                # Build EN envelope from coords (with margin), convert to lon/lat bbox, then build DEM grid
+                if coords.shape[0] > 0:
+                    e_min = float(np.nanmin(coords[:, 0]))
+                    e_max = float(np.nanmax(coords[:, 0]))
+                    n_min = float(np.nanmin(coords[:, 1]))
+                    n_max = float(np.nanmax(coords[:, 1]))
+                    # expand by margin
+                    e_min -= float(dem_margin_m)
+                    e_max += float(dem_margin_m)
+                    n_min -= float(dem_margin_m)
+                    n_max += float(dem_margin_m)
+                    # Convert four corners to lon/lat to make bbox
+                    lon_sw, lat_sw, _ = enu_to_llh(ctx, e_min, n_min, 0.0)
+                    lon_ne, lat_ne, _ = enu_to_llh(ctx, e_max, n_max, 0.0)
+                    from .dem_gml import build_dem_grid_from_folder_for_bbox as _build_bbox  # type: ignore
+                    built_ll = _build_bbox(_Path(str(dem_xml_folder)), float(min(lon_sw, lon_ne)), float(min(lat_sw, lat_ne)), float(max(lon_sw, lon_ne)), float(max(lat_sw, lat_ne)))
+                    if built_ll is not None:
+                        lat_axis_desc, lon_axis_asc, elev_ll = built_ll
+                        # Convert lon/lat axes to ENU axes
+                        # E axis at ref_lat
+                        e_list = []
+                        for lo in lon_axis_asc:
+                            # approximate EN using meters-per-degree linearization
+                            from .dem_gml import _meters_per_degree as _m_deg  # type: ignore
+                            m_per_deg_lon, m_per_deg_lat = _m_deg(float(ref_lat))
+                            e_list.append(float((float(lo) - float(ref_lon)) * m_per_deg_lon))
+                        E_axis = np.asarray(e_list, dtype=float)
+                        # N axis at ref_lon
+                        n_list = []
+                        for la in lat_axis_desc:
+                            from .dem_gml import _meters_per_degree as _m_deg  # type: ignore
+                            m_per_deg_lon, m_per_deg_lat = _m_deg(float(ref_lat))
+                            n_list.append(float((float(la) - float(ref_lat)) * m_per_deg_lat))
+                        N_axis = np.asarray(n_list, dtype=float)
+                        if (dem_spacing_m is not None) and (float(dem_spacing_m) > 0) and E_axis.shape[0] >= 2 and N_axis.shape[0] >= 2:
+                            de = float(abs(E_axis[1] - E_axis[0]))
+                            dn = float(abs(N_axis[0] - N_axis[1]))
+                            step_e = max(1, int(round(float(dem_spacing_m) / max(1e-6, de))))
+                            step_n = max(1, int(round(float(dem_spacing_m) / max(1e-6, dn))))
+                            E_axis = E_axis[::step_e]
+                            N_axis = N_axis[::step_n]
+                            elev_ll = elev_ll[::step_n, ::step_e]
+                        ELEV = elev_ll.astype(float)
+            except Exception:
+                pass
         if (N_axis is not None) and (E_axis is not None) and (ELEV is not None):
             # DEM grid available: use bilinear interpolation for per-point elevation
             # coords currently represent EN parameters from H (plane/tps not applied here)
