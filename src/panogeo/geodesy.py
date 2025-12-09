@@ -69,3 +69,28 @@ def enu_to_llh(ctx: GeoContext, e: float, n: float, u: float) -> Tuple[float, fl
     P = ctx.ecef_ref + v_ecef
     lon, lat, h = ctx.llh_from_ecef.transform(P[0], P[1], P[2])
     return float(lon), float(lat), float(h)
+
+
+def enu_to_llh_batch(ctx: GeoContext, enu: np.ndarray) -> np.ndarray:
+    """
+    Convert Nx3 ENU coordinates to Nx3 lon/lat/height (vectorized).
+    
+    Args:
+        ctx: GeoContext with reference point and transformations
+        enu: Nx3 array of [E, N, U] coordinates in meters
+        
+    Returns:
+        Nx3 array of [lon, lat, height] coordinates
+    """
+    n = enu.shape[0]
+    
+    # Transform ENU to ECEF (vectorized matrix multiplication)
+    ecef_rel = (ctx.R_enu2ecef @ enu.T).T  # Nx3
+    ecef_abs = ecef_rel + ctx.ecef_ref[None, :]  # Nx3
+    
+    # Transform ECEF to LLH (pyproj handles arrays)
+    lon, lat, h = ctx.llh_from_ecef.transform(
+        ecef_abs[:, 0], ecef_abs[:, 1], ecef_abs[:, 2]
+    )
+    
+    return np.stack([lon, lat, h], axis=1).astype(np.float64)

@@ -275,8 +275,13 @@ def _lonlat_to_en_east_north(ctx, lon: float, lat: float) -> Tuple[float, float]
     # We do not have a direct llh->enu here; instead approximate by finite differences around ref.
     # Use numerical approach: find E,N so that enu_to_llh(E,N,0) ≈ (lon,lat).
     # For local small extents, linearization works: E ≈ (lon - ref_lon) * m_per_deg_lon, N ≈ (lat - ref_lat) * m_per_deg_lat
-    ref_lon = ctx["ref_lon"]
-    ref_lat = ctx["ref_lat"]
+    # Support both dict-like access and dataclass attribute access
+    if hasattr(ctx, 'cam_lon'):
+        ref_lon = ctx.cam_lon
+        ref_lat = ctx.cam_lat
+    else:
+        ref_lon = ctx["ref_lon"]
+        ref_lat = ctx["ref_lat"]
     m_per_deg_lon, m_per_deg_lat = _meters_per_degree(float(ref_lat))
     e = float((lon - float(ref_lon)) * m_per_deg_lon)
     n = float((lat - float(ref_lat)) * m_per_deg_lat)
