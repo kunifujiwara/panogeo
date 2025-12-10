@@ -957,3 +957,202 @@ def save_tracking_map_video(
 
     return out_mp4
 
+
+def save_tracking_trajectories_map(
+    geo_csv: str,
+    out_png: str,
+    provider: str = "carto",
+    zoom: Optional[int] = None,
+    api_key: Optional[str] = None,
+    line_width: float = 1.5,
+    line_alpha: float = 0.7,
+    point_size: Optional[float] = None,
+    point_alpha: float = 0.9,
+    dpi: int = 150,
+    margin_frac: float = 0.10,
+    color_by_track: bool = True,
+    line_color: str = "#FF5722",
+    show_endpoints: bool = False,
+    min_track_length: int = 2,
+) -> str:
+    """
+    Save a PNG image with all tracking trajectories accumulated on a basemap.
+    
+    Each track is rendered as a connected line from first to last frame.
+    Useful for visualizing overall movement patterns in a single static image.
+    
+    Parameters
+    ----------
+    geo_csv : str
+        Path to CSV with columns: 'frame', 'track_id', 'lat', 'lon'.
+    out_png : str
+        Output PNG path.
+    provider : str
+        Basemap provider: 'carto', 'osm', 'google', or an XYZ URL.
+    zoom : Optional[int]
+        Explicit tile zoom. If None, contextily chooses based on extent.
+    api_key : Optional[str]
+        API key for Google Map Tiles API (when provider is 'google').
+    line_width : float
+        Width of trajectory lines in points.
+    line_alpha : float
+        Alpha (transparency) of trajectory lines.
+    point_size : Optional[float]
+        If set, draw points at each position along trajectories.
+    point_alpha : float
+        Alpha for points (if point_size is set).
+    dpi : int
+        Output DPI for the PNG.
+    margin_frac : float
+        Fractional padding around data extent.
+    color_by_track : bool
+        If True, each track_id gets a unique color. If False, use line_color for all.
+    line_color : str
+        Color for all lines when color_by_track is False.
+    show_endpoints : bool
+        If True, draw markers at start (circle) and end (square) of each track.
+    min_track_length : int
+        Minimum number of points required to draw a track (default 2).
+        
+    Returns
+    -------
+    str
+        Path to the saved PNG file.
+    """
+    if gpd is None or cx is None:
+        raise RuntimeError("Geo plotting requires geopandas and contextily; install with `pip install panogeo[geo]`")
+    
+    df = pd.read_csv(geo_csv)
+    if df.empty:
+        raise ValueError("No rows in geo CSV")
+    
+    required = {"frame", "track_id", "lat", "lon"}
+    if not required.issubset(df.columns):
+        raise ValueError(f"CSV must contain columns: {sorted(required)}")
+    
+    # Sanitize data
+    df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=["lat", "lon"]).reset_index(drop=True)
+    df["frame"] = df["frame"].astype(int)
+    df["track_id"] = df["track_id"].astype(int)
+    
+    if df.empty:
+        raise ValueError("No valid rows after filtering NaN/inf lat/lon")
+    
+    # Build GeoDataFrame (WGS84 → Web Mercator)
+    geometry = [Point(float(lon), float(lat)) for lat, lon in zip(df["lat"].astype(float), df["lon"].astype(float))]
+    gdf = gpd.GeoDataFrame(df, geometry=geometry, crs="EPSG:4326")
+    gdf_merc = gdf.to_crs(epsg=3857)
+    
+    # Compute extent with padding
+    xmin, ymin, xmax, ymax = gdf_merc.total_bounds
+    xpad = (xmax - xmin) * margin_frac
+    ypad = (ymax - ymin) * margin_frac
+    if xpad == 0:
+        xpad = 100.0
+    if ypad == 0:
+        ypad = 100.0
+    extent = (float(xmin - xpad), float(xmax + xpad), float(ymin - ypad), float(ymax + ypad))
+    
+    # Figure dimensions
+    span_x = float(extent[1] - extent[0])
+    span_y = float(extent[3] - extent[2])
+    base_w_in = 10.0
+    fig_w = base_w_in
+    fig_h = max(1e-6, base_w_in * (span_y / span_x))
+    
+    fig = plt.figure(figsize=(fig_w, fig_h))
+    ax = fig.add_axes([0.0, 0.0, 1.0, 1.0])
+    ax.set_axis_off()
+    ax.set_xlim(extent[0], extent[1])
+    ax.set_ylim(extent[2], extent[3])
+    ax.set_aspect("equal", adjustable="box")
+    
+    # Add basemap with fallback
+    def _resolve_zoom(src_obj, requested):
+        if requested is not None:
+            try:
+                return int(requested)
+            except Exception:
+                pass
+        try:
+            z = int(getattr(src_obj, "max_zoom", 18)) - 1
+            return max(2, z)
+        except Exception:
+            return 17
+    
+    def _add_basemap_with_fallback(ax, provider_name: str, requested_zoom):
+        last_err = None
+        src_obj = _get_provider(provider_name, api_key=api_key)
+        z = _resolve_zoom(src_obj, requested_zoom)
+        for _ in range(5):
+            try:
+                cx.add_basemap(ax, source=src_obj, crs="EPSG:3857", zoom=z, attribution=True, reset_extent=False)
+                return
+            except Exception as e:
+                last_err = e
+                z = max(2, z - 1)
+        try:
+            print(f"[basemap] Primary provider '{provider_name}' failed; attempting fallbacks (last error: {last_err})")
+        except Exception:
+            pass
+        for fb in ("esri-world", "carto", "osm"):
+            try:
+                src_fb = _get_provider(fb, api_key=api_key)
+                z = _resolve_zoom(src_fb, requested_zoom)
+                cx.add_basemap(ax, source=src_fb, crs="EPSG:3857", zoom=z, attribution=True, reset_extent=False)
+                try:
+                    print(f"[basemap] Fallback provider used: '{fb}'")
+                except Exception:
+                    pass
+                return
+            except Exception as e2:
+                last_err = e2
+        if last_err is not None:
+            raise last_err
+    
+    _add_basemap_with_fallback(ax, provider, zoom)
+    ax.set_xlim(extent[0], extent[1])
+    ax.set_ylim(extent[2], extent[3])
+    ax.set_aspect("equal", adjustable="box")
+    
+    # Group by track_id and sort by frame
+    track_groups = gdf_merc.groupby("track_id")
+    
+    n_tracks = 0
+    n_points = 0
+    
+    for track_id, group in track_groups:
+        # Sort by frame to get temporal order
+        group_sorted = group.sort_values("frame")
+        
+        if len(group_sorted) < min_track_length:
+            continue
+        
+        # Extract coordinates
+        xs = [float(pt.x) for pt in group_sorted.geometry]
+        ys = [float(pt.y) for pt in group_sorted.geometry]
+        
+        # Determine color
+        if color_by_track:
+            color = id_color_rgb01(int(track_id))
+        else:
+            color = line_color
+        
+        # Draw trajectory line
+        ax.plot(xs, ys, color=color, linewidth=line_width, alpha=line_alpha, solid_capstyle="round", zorder=10)
+        
+        n_tracks += 1
+        n_points += len(xs)
+    
+    # Save figure
+    os.makedirs(os.path.dirname(os.path.abspath(out_png)) or ".", exist_ok=True)
+    fig.savefig(out_png, dpi=dpi, bbox_inches="tight", pad_inches=0)
+    plt.close(fig)
+    
+    try:
+        print(f"[trajectories-map] Saved {n_tracks} tracks ({n_points:,} points) to: {out_png}")
+    except Exception:
+        pass
+    
+    return out_png
+
