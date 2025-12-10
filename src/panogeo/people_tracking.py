@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Deque, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 from collections import deque
 from pathlib import Path
@@ -20,6 +20,9 @@ __all__ = [
     "run_tracking",
 ]
 
+# History length for occlusion detection (number of frames)
+_EDGE_HISTORY_LEN = 15
+
 
 @dataclass
 class Track:
@@ -27,6 +30,88 @@ class Track:
     centroid: Tuple[int, int]
     bbox: Tuple[int, int, int, int]
     disappeared: int = 0
+    # Edge history for occlusion detection
+    top_history: Deque[float] = field(default_factory=lambda: deque(maxlen=_EDGE_HISTORY_LEN))
+    bottom_history: Deque[float] = field(default_factory=lambda: deque(maxlen=_EDGE_HISTORY_LEN))
+    height_history: Deque[float] = field(default_factory=lambda: deque(maxlen=_EDGE_HISTORY_LEN))
+
+    def update_bbox(self, bbox: Tuple[int, int, int, int]) -> None:
+        """Update bbox and record edge history for occlusion detection."""
+        x1, y1, x2, y2 = bbox
+        self.bbox = bbox
+        self.top_history.append(float(y1))
+        self.bottom_history.append(float(y2))
+        self.height_history.append(float(y2 - y1))
+
+    @property
+    def expected_height(self) -> float:
+        """Expected box height based on recent history (median)."""
+        if len(self.height_history) >= 5:
+            return float(np.median(list(self.height_history)))
+        return float(self.bbox[3] - self.bbox[1])
+
+    def is_bottom_occluded(
+        self,
+        bottom_jump_threshold_px: float = 25.0,
+        height_shrink_ratio: float = 0.75,
+    ) -> bool:
+        """
+        Detect if bottom edge is likely occluded.
+        
+        Occlusion signature: bottom edge jumps up suddenly while top edge 
+        stays relatively stable, OR current height is significantly smaller
+        than expected height from history.
+        
+        Args:
+            bottom_jump_threshold_px: Min upward jump in bottom edge to trigger
+            height_shrink_ratio: If current_height < expected * ratio, flag as occluded
+            
+        Returns:
+            True if bottom appears to be occluded
+        """
+        if len(self.bottom_history) < 3:
+            return False
+        
+        x1, y1, x2, y2 = self.bbox
+        current_height = float(y2 - y1)
+        
+        # Method 1: Height significantly smaller than expected
+        if current_height < self.expected_height * height_shrink_ratio:
+            return True
+        
+        # Method 2: Bottom edge jumped up while top stayed stable
+        # (positive delta = jumped up, since y increases downward)
+        bottom_list = list(self.bottom_history)
+        top_list = list(self.top_history)
+        
+        prev_bottom = bottom_list[-2]
+        curr_bottom = bottom_list[-1]
+        bottom_delta = prev_bottom - curr_bottom  # positive = jumped up
+        
+        prev_top = top_list[-2]
+        curr_top = top_list[-1]
+        top_delta = abs(curr_top - prev_top)
+        
+        # Occlusion: bottom jumps up significantly, top relatively stable
+        if bottom_delta > bottom_jump_threshold_px and top_delta < bottom_jump_threshold_px * 0.5:
+            return True
+        
+        return False
+
+    def get_corrected_bottom(self) -> float:
+        """
+        Get corrected bottom edge position when occlusion is detected.
+        
+        Uses the expected height from history to estimate where the 
+        bottom edge should be based on the current top edge.
+        
+        Returns:
+            Corrected y2 (bottom edge) coordinate
+        """
+        x1, y1, x2, y2 = self.bbox
+        expected_h = self.expected_height
+        corrected_y2 = y1 + expected_h
+        return corrected_y2
 
 
 class CentroidTracker:
@@ -51,12 +136,15 @@ class CentroidTracker:
         self.min_iou_for_match = float(min_iou_for_match)
 
     def register(self, centroid: Tuple[int, int], bbox: Tuple[int, int, int, int]) -> None:
-        self.tracks[self.next_object_id] = Track(
+        track = Track(
             object_id=self.next_object_id,
             centroid=centroid,
             bbox=bbox,
             disappeared=0,
         )
+        # Initialize edge history with current bbox
+        track.update_bbox(bbox)
+        self.tracks[self.next_object_id] = track
         self.next_object_id += 1
 
     def deregister(self, object_id: int) -> None:
@@ -132,7 +220,7 @@ class CentroidTracker:
             object_id = object_ids[row]
             centroid = (int(input_centroids[col][0]), int(input_centroids[col][1]))
             self.tracks[object_id].centroid = centroid
-            self.tracks[object_id].bbox = rects[col]
+            self.tracks[object_id].update_bbox(rects[col])  # Updates bbox and edge history
             self.tracks[object_id].disappeared = 0
 
             used_rows.add(row)
@@ -378,11 +466,17 @@ def run_tracking(
 
         writer.write(roi)
         # Collect rows for export: use bottom-center of bbox (feet) as v_px
+        # With occlusion detection: if bottom appears occluded, provide corrected v_px
         if export_csv_path is not None:
             for oid, tr in tracks.items():
                 x1b, y1b, x2b, y2b = tr.bbox
                 u = float((x1b + x2b) * 0.5)
-                v = float(y2b)
+                v_bbox = float(y2b)  # Raw bottom edge
+                
+                # Occlusion detection
+                is_occluded = tr.is_bottom_occluded()
+                v_corrected = tr.get_corrected_bottom() if is_occluded else v_bbox
+                
                 csv_rows.append({
                     "video": str(video_path),
                     "image": f"{video_base}_f{frame_count:06d}",
@@ -398,8 +492,13 @@ def run_tracking(
                     # Optional provenance/debug info
                     "SRC_W": int(src_w),
                     "SRC_H": int(src_h),
+                    # Use corrected v_px by default (accounts for occlusion)
                     "u_px": u,
-                    "v_px": v,
+                    "v_px": v_corrected,
+                    # Occlusion detection outputs
+                    "v_px_raw": v_bbox,
+                    "bottom_occluded": int(is_occluded),
+                    "box_height_px": int(y2b - y1b),
                 })
 
     cap.release()
