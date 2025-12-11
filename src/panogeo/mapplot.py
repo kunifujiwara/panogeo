@@ -865,7 +865,11 @@ def save_tracking_map_video(
         pbar = None
         if show_progress:
             try:
-                from tqdm import tqdm  # type: ignore
+                # Try tqdm.auto for better notebook support
+                try:
+                    from tqdm.auto import tqdm
+                except ImportError:
+                    from tqdm import tqdm
                 pbar = tqdm(total=len(all_frames), desc=(progress_desc or "map-video"), unit="frame")
             except Exception:
                 pbar = None
@@ -944,7 +948,7 @@ def save_tracking_map_video(
                 pbar.update(1)
             elif show_progress and (idx % 25 == 0):
                 try:
-                    print(f"[map-video] frame {idx+1}/{len(all_frames)}", flush=True)
+                    print(f"\r[map-video] frame {idx+1}/{len(all_frames)}", end="", flush=True)
                 except Exception:
                     pass
     finally:
@@ -952,6 +956,8 @@ def save_tracking_map_video(
         try:
             if pbar is not None:
                 pbar.close()
+            elif show_progress:
+                print()
         except Exception:
             pass
 

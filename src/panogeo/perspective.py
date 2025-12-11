@@ -1203,6 +1203,8 @@ def geolocate_detections_perspective(
     dem_xml_folder: Optional[str] = None,
     dem_margin_m: float = 120.0,
     dem_spacing_m: Optional[float] = None,
+    smoothing_window: int = 0,
+    max_velocity_m: Optional[float] = None,
 ) -> Tuple[str, str]:
     """
     Geolocate detection points using either monoplotting or homography.
@@ -1210,6 +1212,11 @@ def geolocate_detections_perspective(
     Automatically detects calibration type and uses appropriate method:
     - Monoplotting: Ray-DEM intersection for accurate 3D projection
     - Homography: Legacy 2D projective transform
+    
+    Args:
+        ...
+        smoothing_window: If > 0, applies post-processing smoothing to the geolocated tracks.
+        max_velocity_m: If set, limits the maximum velocity (m/frame) during smoothing.
     """
     os.makedirs(output_dir, exist_ok=True)
     
@@ -1499,5 +1506,24 @@ def geolocate_detections_perspective(
     geo_csv = os.path.join(output_dir, "all_people_geo_calibrated.csv")
     df.to_csv(xy_csv, index=False)
     df.to_csv(geo_csv, index=False)
+    
+    # Optional: Apply smoothing
+    if smoothing_window > 0:
+        try:
+            from .people_tracking import smooth_geotracks_csv
+            if debug:
+                print(f"[persp] applying smoothing: window={smoothing_window}, max_vel={max_velocity_m}")
+            
+            # Overwrite the geo_csv with the smoothed version
+            smooth_geotracks_csv(
+                geo_csv_path=geo_csv,
+                calibration_npz=homography_npz,
+                output_path=geo_csv,
+                window_size=smoothing_window,
+                max_velocity_m=max_velocity_m,
+            )
+        except Exception as e:
+            if debug:
+                print(f"[persp] smoothing failed: {e}")
     
     return xy_csv, geo_csv
