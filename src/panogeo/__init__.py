@@ -16,6 +16,8 @@ __all__ = [
     "save_homography",
     "load_homography",
     "geolocate_detections_perspective",
+    # Pipeline
+    "run_pipeline",
 ]
 
 __version__ = "0.1.0"
@@ -36,3 +38,4 @@ from .perspective import (  # noqa: E402
     load_homography,
     geolocate_detections_perspective,
 )
+from .pipeline import run_pipeline

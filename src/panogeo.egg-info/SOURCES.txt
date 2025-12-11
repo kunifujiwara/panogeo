@@ -11,6 +11,7 @@ src/panogeo/geometry.py
 src/panogeo/mapplot.py
 src/panogeo/people_tracking.py
 src/panogeo/perspective.py
+src/panogeo/pipeline.py
 src/panogeo/ui.py
 src/panogeo/utils.py
 src/panogeo/video.py
